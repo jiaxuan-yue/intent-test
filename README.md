@@ -69,9 +69,7 @@ bash install.sh --force           # 覆盖已有安装
 ### 手动安装
 
 ```bash
-mkdir -p .claude/skills/intent-test
-cp intent-test/.claude/skills/intent-test.md .claude/skills/
-cp intent-test/.claude/skills/intent-test/runner.py .claude/skills/intent-test/
+cp -r intent-test/.claude/skills/ .claude/skills/
 ```
 
 ### 验证
@@ -100,8 +98,9 @@ cp intent-test/.claude/skills/intent-test/runner.py .claude/skills/intent-test/
 # L3: 单轮关键词测试
 runner.py run --suite suite.json --adapter dialog --output report.json
 
-# L2: 多轮 FSM 测试（支持从任意状态注入）
-runner.py run_multi --suite fsm.json --adapter dialog --output report.json
+# L2: 多轮 FSM 测试（状态注入 + 状态名映射）
+runner.py run_multi --suite fsm.json --adapter dialog \
+  --config config.json --output report.json
 
 # L1: LLM 路由层测试（自动 mock）
 runner.py run_layer1 --suite routing.json --config config.json --output report.json
@@ -110,6 +109,8 @@ runner.py run_layer1 --suite routing.json --config config.json --output report.j
 runner.py report_unified --reports layer1.json layer2.json layer3.json
 ```
 
+所有命令支持 `--project-root /path/to/project` 显式指定项目根目录。
+
 ### 工具命令
 
 ```bash
@@ -117,6 +118,22 @@ runner.py check_deps       # 检查依赖（可用/被 mock/缺失）
 runner.py fsm_coverage      # FSM 状态转换覆盖率分析
 runner.py quick --input "X" --context '{"status":"active"}'  # 带上下文的快速测试
 ```
+
+## 状态名映射
+
+内置的多轮场景使用通用状态名（`active`、`confirm_exit`），但你的项目可能用不同的名字。Claude 读完 FSM 代码后会在 `config.json` 中生成映射：
+
+```json
+{
+  "state_mapping": {
+    "active": "collecting",
+    "confirm_exit": "await_exit_confirm",
+    "idle": "idle"
+  }
+}
+```
+
+`run_multi --config config.json` 读取映射，自动翻译所有状态名后再执行测试。
 
 ## 工作原理
 
@@ -186,7 +203,15 @@ intent-test/
 │   └── skills/
 │       ├── intent-test.md           # Skill 定义（Claude 指令）
 │       └── intent-test/
-│           └── runner.py            # 执行层脚本
+│           ├── runner.py            # CLI 入口（~120 行）
+│           ├── adapters.py          # BaseAdapter + 4 适配器类
+│           ├── commands_single.py   # 单轮测试命令
+│           ├── commands_multi.py    # 多轮 FSM 命令 + 场景模板
+│           ├── commands_layer1.py   # LLM 路由层测试
+│           ├── commands_analysis.py # 统一报告 + 覆盖率 + 依赖检查
+│           ├── mock.py              # 依赖 mock + LLM mock
+│           ├── common.py            # 共享工具函数
+│           └── extract.py           # 关键词提取
 ├── install.sh                       # 一键安装
 ├── README.md                        # 本文件
 └── .gitignore
@@ -197,13 +222,26 @@ intent-test/
 ```yaml
 - name: Intent Tests
   run: |
-    # Claude 生成配置和测试后，runner.py 执行
     python .claude/skills/intent-test/runner.py run \
-      --suite tests/generated/suite.json --output report.json
+      --suite tests/generated/suite.json \
+      --project-root . \
+      --output report.json
+
+    python .claude/skills/intent-test/runner.py run_multi \
+      --suite tests/generated/fsm_multi.json \
+      --config tests/generated/config.json \
+      --project-root . \
+      --output multi_report.json
 
 - name: Check
   run: |
-    python3 -c "import json; r=json.load(open('report.json')); assert r['pass_rate']>=0.8"
+    python3 -c "
+    import json
+    r1 = json.load(open('report.json'))
+    r2 = json.load(open('multi_report.json'))
+    assert r1['pass_rate'] >= 0.8, f'L3 pass rate {r1[\"pass_rate\"]} < 0.8'
+    assert r2['pass_rate'] >= 0.8, f'L2 pass rate {r2[\"pass_rate\"]} < 0.8'
+    "
 ```
 
 ## 许可证

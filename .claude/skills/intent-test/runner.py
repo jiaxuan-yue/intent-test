@@ -95,6 +95,8 @@ class DialogFunctionsAdapter(BaseAdapter):
         self._keywords = _extract_keywords_from_prompts(self.root)
 
     def _load_dialog(self):
+        """Find dialog.py by searching common locations, then fall back to rglob."""
+        # Try common locations first (fast path)
         candidates = [
             self.root / "src" / "intent_recognition" / "dialog.py",
             self.root / "app" / "core" / "dialog.py",
@@ -107,11 +109,16 @@ class DialogFunctionsAdapter(BaseAdapter):
             if c.exists():
                 dialog_path = c
                 break
+
+        # Fall back to recursive search
         if dialog_path is None:
             for p in self.root.rglob("dialog.py"):
-                if "test" not in str(p) and "__pycache__" not in str(p):
+                skip = any(d in str(p) for d in
+                           ["test", "__pycache__", "node_modules", ".venv", "venv", "site-packages"])
+                if not skip:
                     dialog_path = p
                     break
+
         if dialog_path is None:
             raise ImportError("dialog.py not found in project")
 
@@ -159,15 +166,60 @@ class DialogFunctionsAdapter(BaseAdapter):
         return dialog
 
     def _discover_functions(self) -> Dict[str, Callable]:
+        """Auto-discover intent detection functions using introspection.
+
+        Instead of matching by name, we filter by signature:
+        - Must be callable
+        - Must accept exactly 1 positional parameter (the input text)
+        - The parameter should be str-typed or untyped
+        - Skip async functions (those are multi-turn handlers)
+        - Skip private helpers that take complex types (dict, list, etc.)
+        """
         funcs = {}
         for name in dir(self.dialog):
+            if name.startswith("__"):
+                continue
             obj = getattr(self.dialog, name)
-            if callable(obj) and any(kw in name.lower() for kw in
-                    ["detect", "intent", "is_", "match", "classify",
-                     "recognize", "has_", "plan", "handle"]):
-                funcs[name] = obj
+            if not callable(obj):
+                continue
+
+            # Skip classes
+            if inspect.isclass(obj):
+                continue
+
+            # Skip async functions (multi-turn handlers, not single-turn detectors)
+            if asyncio.iscoroutinefunction(obj):
+                continue
+
+            try:
+                sig = inspect.signature(obj)
+            except (ValueError, TypeError):
+                continue
+
+            params = list(sig.parameters.values())
+
+            # Must accept exactly 1 positional arg (the input text)
+            positional = [p for p in params
+                          if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+                          and p.default is inspect.Parameter.empty]
+            if len(positional) != 1:
+                continue
+
+            # Check parameter type annotation — accept str or untyped
+            param = positional[0]
+            if param.annotation is not inspect.Parameter.empty:
+                ann = param.annotation
+                if isinstance(ann, type) and ann is not str:
+                    continue  # skip dict, list, BaseModel, etc.
+                if hasattr(ann, "__origin__") and ann.__origin__ is not str:
+                    continue  # skip Optional[dict], List[str], etc.
+
+            # Name heuristic: prefer functions with intent-related names,
+            # but don't EXCLUDE by name — signature is the source of truth
+            funcs[name] = obj
+
         if not funcs:
-            raise ImportError("No intent detection functions found in dialog.py")
+            raise ImportError("No single-argument detection functions found in dialog.py")
         return funcs
 
     def detect_intents(self, input_text: str, context: dict = None) -> dict:
@@ -192,13 +244,8 @@ class DialogFunctionsAdapter(BaseAdapter):
         return list(self.functions.keys())
 
     def get_handle_fn(self) -> Optional[Callable]:
-        # Look for common multi-turn handler names
-        for name in ["handle_plan_chat", "handle_dialog", "handle_turn",
-                      "process_message", "handle_message"]:
-            fn = getattr(self.dialog, name, None)
-            if fn and (asyncio.iscoroutinefunction(fn) or callable(fn)):
-                return fn
-        return None
+        """Auto-detect multi-turn handler by signature."""
+        return _find_handler_by_signature(self.dialog)
 
     def get_module(self):
         return self.dialog
@@ -278,12 +325,7 @@ class LLMAnalyzerAdapter(BaseAdapter):
         return ["match"]
 
     def get_handle_fn(self):
-        for name in ["handle_plan_chat", "handle_dialog", "handle_turn",
-                      "process_message", "handle_message"]:
-            fn = getattr(self._mod, name, None)
-            if fn and callable(fn):
-                return fn
-        return None
+        return _find_handler_by_signature(self._mod)
 
 
 # ===================================================================
@@ -315,12 +357,57 @@ class CustomAdapter(BaseAdapter):
         return getattr(self._mod, "FUNCTIONS", ["match"])
 
     def get_handle_fn(self):
-        for name in ["handle_plan_chat", "handle_dialog", "handle_turn",
-                      "process_message", "handle_message"]:
-            fn = getattr(self._mod, name, None)
-            if fn and callable(fn):
-                return fn
+        return _find_handler_by_signature(self._mod)
+
+
+# ===================================================================
+# Shared: signature-based handler detection
+# ===================================================================
+
+def _find_handler_by_signature(module) -> Optional[Callable]:
+    """Find a multi-turn handler in any module by introspecting function signatures.
+
+    Looks for async functions with message-like + session-like parameters.
+    No hardcoded function names — pure signature-based detection.
+    """
+    candidates = []
+    for name in dir(module):
+        if name.startswith("__"):
+            continue
+        obj = getattr(module, name)
+        if not callable(obj) or inspect.isclass(obj):
+            continue
+
+        try:
+            sig = inspect.signature(obj)
+        except (ValueError, TypeError):
+            continue
+
+        params = list(sig.parameters.values())
+        if len(params) < 2:
+            continue
+
+        # Check for message-like + session-like params by name
+        msg_names = {"user_message", "message", "input_text", "text",
+                     "msg", "input", "user_input", "query"}
+        session_names = {"session", "plan_session", "context", "state",
+                        "dialog_state", "current_session", "conversation"}
+
+        has_msg = any(p.name.lower() in msg_names for p in params)
+        has_session = any(p.name.lower() in session_names for p in params)
+
+        if has_msg and has_session:
+            # Prefer async handlers for multi-turn
+            score = len(params)
+            if asyncio.iscoroutinefunction(obj):
+                score += 100
+            candidates.append((score, name, obj))
+
+    if not candidates:
         return None
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][2]
 
 
 # ===================================================================
@@ -904,7 +991,7 @@ def cmd_run_multi(args):
 
     handle_fn = adapter.get_handle_fn()
     if handle_fn is None:
-        _exit_error("No multi-turn handler found in dialog module (looked for handle_plan_chat, handle_dialog, handle_turn, process_message)")
+        _exit_error("No multi-turn handler found. Looking for async function with (message, session) parameters.")
 
     normalize_fn = None
     for name in ["_normalize_plan_session", "_normalize_session", "normalize_session"]:
@@ -1032,7 +1119,11 @@ def _run_scenario(scenario, handle_fn, normalize_fn, transitions):
 
 
 def _call_handle_fn(handle_fn, normalize_fn, user_message, session, has_context):
-    """Call a multi-turn handler, handling async/sync and various signatures."""
+    """Call a multi-turn handler by introspecting its signature.
+
+    Instead of trying hardcoded call variants, we inspect the function's
+    parameters and dynamically build the correct kwargs.
+    """
     if normalize_fn and session is None:
         try:
             session = normalize_fn(None)
@@ -1042,53 +1133,78 @@ def _call_handle_fn(handle_fn, normalize_fn, user_message, session, has_context)
     start = time.perf_counter()
     is_async = asyncio.iscoroutinefunction(handle_fn) or inspect.iscoroutinefunction(handle_fn)
 
-    call_variants = [
-        {"user_message": user_message, "plan_session": session, "has_plan": has_context},
-        {"user_message": user_message, "session": session, "has_context": has_context},
-        {"user_message": user_message, "plan_session": session},
-        {"user_message": user_message, "session": session},
-        {"input_text": user_message, "plan_session": session, "has_plan": has_context},
-        {"message": user_message, "session": session},
-    ]
+    # Introspect signature and build kwargs dynamically
+    try:
+        sig = inspect.signature(handle_fn)
+    except (ValueError, TypeError):
+        raise RuntimeError(f"Cannot inspect signature of {handle_fn}")
 
-    result = None
-    last_error = None
-    for kwargs in call_variants:
-        try:
-            if is_async:
-                result = asyncio.run(handle_fn(**kwargs))
-            else:
-                result = handle_fn(**kwargs)
-            if isinstance(result, dict):
-                break
-            elif hasattr(result, "__dict__"):
-                result = {k: v for k, v in result.__dict__.items() if not k.startswith("_")}
-                break
-            elif isinstance(result, tuple) and len(result) >= 2:
-                result = {"plan_session": result[0], "handled": result[1]}
-                break
-            else:
-                result = {"plan_session": result}
-                break
-        except TypeError:
+    kwargs = {}
+    for param_name, param in sig.parameters.items():
+        # Map parameter names to values based on semantic matching
+        name_lower = param_name.lower()
+
+        if name_lower in ("user_message", "message", "input_text",
+                          "text", "msg", "input", "user_input"):
+            kwargs[param_name] = user_message
+
+        elif name_lower in ("session", "plan_session", "context",
+                            "state", "dialog_state", "current_session"):
+            kwargs[param_name] = session
+
+        elif name_lower in ("has_plan", "has_context", "existing",
+                            "has_existing", "has_active"):
+            kwargs[param_name] = has_context
+
+        elif name_lower in ("task_id", "id", "conversation_id",
+                            "thread_id", "chat_id"):
+            kwargs[param_name] = "test_task_id"
+
+        elif name_lower in ("existing_plan", "current_plan", "plan",
+                            "active_plan"):
+            kwargs[param_name] = session  # reuse session as plan
+
+        elif param.default is not inspect.Parameter.empty:
+            # Has a default — skip, let it use the default
             continue
-        except Exception as e:
-            last_error = e
-            continue
+
+        else:
+            # Unknown required param — pass None and hope for the best
+            kwargs[param_name] = None
+
+    try:
+        if is_async:
+            result = asyncio.run(handle_fn(**kwargs))
+        else:
+            result = handle_fn(**kwargs)
+    except Exception as e:
+        raise RuntimeError(f"Handler call failed: {e}")
 
     elapsed = round((time.perf_counter() - start) * 1000, 2)
-    if result is None:
-        raise RuntimeError(f"Could not call multi-turn handler: {last_error}")
+
+    # Normalize result to dict
+    if isinstance(result, dict):
+        pass
+    elif hasattr(result, "__dict__"):
+        result = {k: v for k, v in result.__dict__.items() if not k.startswith("_")}
+    elif isinstance(result, tuple) and len(result) >= 2:
+        result = {"session": result[0], "handled": result[1]}
+    else:
+        result = {"session": result}
 
     result["elapsed_ms"] = elapsed
-    # Normalize session key
-    if "session" not in result and "plan_session" in result:
-        result["session"] = result["plan_session"]
-    elif "plan_session" not in result and "session" in result:
-        result["plan_session"] = result["session"]
-    elif "session" not in result and "plan_session" not in result and "status" in result:
-        result["session"] = result
-        result["plan_session"] = result
+
+    # Normalize session key — check all common names
+    for session_key in ["session", "plan_session", "context", "state"]:
+        if session_key in result:
+            result["session"] = result[session_key]
+            result["plan_session"] = result[session_key]
+            break
+    else:
+        if "status" in result:
+            result["session"] = result
+            result["plan_session"] = result
+
     return result
 
 
@@ -1270,10 +1386,22 @@ def cmd_check_deps(args):
 # ===================================================================
 
 def _resolve_project_root() -> Path:
+    """Auto-detect project root by scanning for common markers."""
     current = Path(__file__).resolve().parent
     for _ in range(10):
-        if ((current / "src").is_dir() or (current / "pyproject.toml").exists()
-                or (current / "app").is_dir()):
+        # Any of these signals a project root
+        if any([
+            (current / "src").is_dir(),
+            (current / "app").is_dir(),
+            (current / "lib").is_dir(),
+            (current / "pyproject.toml").exists(),
+            (current / "setup.py").exists(),
+            (current / "setup.cfg").exists(),
+            (current / "requirements.txt").exists(),
+            (current / "Pipfile").exists(),
+            (current / "poetry.lock").exists(),
+            (current / ".git").is_dir(),
+        ]):
             return current
         current = current.parent
     return Path.cwd()

@@ -84,7 +84,7 @@ Generate test cases across 7 categories. For each intent, produce cases proporti
 | **Adversarial** | Negations ("不想学"), typos ("pythn"), irrelevant noise | 3-5 | P1 |
 | **Regression** | Previously failed cases (load from file if available) | All | P0 |
 | **Performance** | Response time under threshold | 1-2 | P2 |
-| **Multi-turn** | Conversation context shifts | 2-3 | P2 |
+| **Multi-turn** | Conversation context shifts, FSM state transitions | 12 scenarios | P1 |
 | **Context-aware** | State-dependent recognition | 1-2 | P2 |
 
 **Generation rules:**
@@ -130,6 +130,32 @@ Display readable report:
 python .claude/skills/intent-test/runner.py report --results tests/generated/intent_tests_report.json
 ```
 
+#### Multi-Turn State Machine Testing
+
+For projects with dialog state machines (e.g., `handle_plan_chat()` with FSM states), use the dedicated multi-turn commands:
+
+```bash
+# Generate 12 built-in FSM scenarios (covers all state transitions)
+python .claude/skills/intent-test/runner.py generate_multi --name plan_fsm
+
+# Execute multi-turn scenarios
+python .claude/skills/intent-test/runner.py run_multi \
+  --suite tests/generated/plan_fsm_multi.json \
+  --adapter dialog \
+  --output tests/generated/plan_fsm_multi_report.json
+
+# Display state transition coverage report
+python .claude/skills/intent-test/runner.py report_multi \
+  --results tests/generated/plan_fsm_multi_report.json
+```
+
+**How it works:**
+- 12 built-in scenarios cover all 6 FSM states and major transition paths
+- Each scenario chains multiple turns, passing `plan_session` between calls
+- LLM dependencies are mocked: `_get_chat_model()` raises → fallback to `_next_default_question()`
+- `asyncio.run()` wraps async `handle_plan_chat()` calls
+- Validates status, mode, handled flag, and turn count after each turn
+
 ### Phase 4: Analyze Results
 
 Compute and present:
@@ -146,6 +172,18 @@ Compute and present:
 3. **Keyword conflict matrix** — overlapping keywords between intents
 
 4. **Coverage gaps** — which intents lack test coverage
+
+5. **State transition coverage** (multi-turn tests):
+   ```
+   State Transition Coverage:
+     idle → collecting:         3/3 ✅
+     collecting → await_exit:   2/2 ✅
+     await_exit → idle:         1/1 ✅
+     await_exit → collecting:   1/1 ✅
+     ...
+   Uncovered: 2 transitions
+   ```
+   Warn if any major transition path has zero coverage.
 
 ### Phase 5: Suggest & Apply Fixes
 
@@ -172,8 +210,10 @@ Write all outputs to the configured output directory (default: `tests/generated/
 | File | Content |
 |------|---------|
 | `adapter.py` | Auto-generated adapter for the project's intent system |
-| `{name}.json` | Test suite definition |
-| `{name}_report.json` | Raw test results with timing |
+| `{name}.json` | Single-turn test suite definition |
+| `{name}_report.json` | Single-turn test results with timing |
+| `{name}_multi.json` | Multi-turn FSM scenario definitions |
+| `{name}_multi_report.json` | Multi-turn results with state transition coverage |
 | `{name}_summary.md` | Markdown analysis report |
 | `{name}_fixes.md` | Applied fixes changelog (if auto-fix ran) |
 
@@ -183,7 +223,7 @@ Parse from user's skill invocation (e.g., `/intent-test mode=analyze auto_fix=tr
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `mode` | `analyze` | `generate` / `run` / `analyze` / `quick` / `fix` / `research` |
+| `mode` | `analyze` | `generate` / `run` / `analyze` / `quick` / `fix` / `research` / `generate_multi` / `run_multi` / `analyze_multi` |
 | `intents` | auto-detect | JSON string of custom intents (fallback if no code found) |
 | `name` | `intent_tests` | Suite name |
 | `output_dir` | `tests/generated` | Output directory |

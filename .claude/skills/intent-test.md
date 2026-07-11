@@ -9,24 +9,51 @@ Test any intent recognition system end-to-end: generate cases → execute → an
 
 ## Workflow
 
-### Phase 1: Understand the System
+### Phase 1: Auto-Discover and Understand the Intent System
 
-1. Locate the intent recognition module. Search for:
-   - `src/intent_recognition/engine/` or similar paths containing `RuleEngine`
-   - Files matching `*engine*.py`, `*intent*.py`, `*recogni*.py`
-   - Any `keyword_rules`, `intent_map`, or configuration JSON/YAML defining intents
+**Step 1 — Broad file discovery.** Scan the project directory to locate the intent recognition module. Use multiple search strategies in parallel:
 
-2. Read the engine code to extract:
-   - **Intent definitions** — all intent names/enums
-   - **Keyword rules** — keywords mapped to each intent
-   - **Confidence thresholds** — min/max confidence values
-   - **Pattern matchers** — regex or template patterns
-   - **Fallback behavior** — what happens on no match
+```
+# File name patterns (use find or glob)
+find . -type f -name "*.py" | grep -iE "intent|engine|recogni|classify|nlp|router"
+find . -type f -name "*.json" -o -name "*.yaml" -o -name "*.yml" | grep -iE "intent|rule|keyword|config"
 
-3. If no engine code exists, ask the user to provide intents as JSON:
-   ```json
-   {"greeting": ["你好", "hi", "hello"], "farewell": ["再见", "bye"]}
-   ```
+# Directory patterns
+find . -type d -name "*intent*" -o -type d -name "*engine*" -o -type d -name "*nlp*" -o -type d -name "*recogni*"
+```
+
+**Step 2 — Keyword scan.** If file names don't reveal the module, grep for intent-related code patterns across all source files:
+
+```
+grep -rl "intent" --include="*.py" --include="*.json" --include="*.yaml" .
+grep -rl "keyword_rule\|intent_map\|match.*intent\|recognize\|classify" --include="*.py" .
+```
+
+**Step 3 — Read and analyze discovered files.** For each candidate file, read it and identify:
+- **Intent definitions** — enum classes, string constants, dict/list of intent names
+- **Keyword/rule mappings** — `{"intent_name": ["keyword1", "keyword2"]}` patterns
+- **Matching logic** — how inputs are compared to rules (exact match, regex, fuzzy, TF-IDF, embedding similarity)
+- **Confidence scoring** — how confidence is calculated, what thresholds trigger a match vs fallback
+- **Pattern matchers** — regex patterns, template slots, NER extractors
+- **Fallback behavior** — what happens when no intent matches (return None? call LLM? ask clarification?)
+- **Pre/post-processing** — text normalization, tokenization, stop word removal
+
+**Step 4 — Build intent model.** Synthesize what you've read into a structured model:
+```
+Intents discovered:
+  - greeting: keywords=[你好, hi, hello, 嗨], patterns=[r"^你好.*"], confidence_threshold=0.5
+  - farewell: keywords=[再见, bye, 拜拜], confidence_threshold=0.6
+  - ...
+Matching strategy: keyword scoring + regex fallback
+Fallback: returns None when confidence < 0.3
+```
+
+**Step 5 — Fallback if nothing found.** Only if Steps 1-4 find zero intent-related code:
+- Tell the user: "No intent recognition module detected in this project."
+- Ask them to either point to the module path or provide intents as JSON:
+  ```json
+  {"greeting": ["你好", "hi"], "farewell": ["再见", "bye"]}
+  ```
 
 ### Phase 2: Generate Test Cases
 

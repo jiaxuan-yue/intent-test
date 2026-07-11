@@ -80,21 +80,21 @@ class DialogFunctionsAdapter(BaseAdapter):
             raise ImportError("dialog.py not found in project")
 
         src_dir = dialog_path.parent
-        pkg_parts = []
-        p = src_dir
-        while p.parent != p:
-            if (p / "__init__.py").exists():
-                pkg_parts.insert(0, p.name)
-                p = p.parent
-            else:
-                break
+        # Compute package path using relative_to from project root
+        # e.g. project_root/app/core/task/dialog.py → "app.core.task"
+        try:
+            rel = dialog_path.parent.relative_to(self.root)
+            pkg_parts = list(rel.parts)
+        except ValueError:
+            pkg_parts = []
         pkg_prefix = ".".join(pkg_parts) + "." if pkg_parts else ""
 
+        # Register parent packages
         for i in range(len(pkg_parts)):
             pkg = ".".join(pkg_parts[:i + 1])
             if pkg not in sys.modules:
                 pkg_mod = types.ModuleType(pkg)
-                pkg_mod.__path__ = [str(p)]
+                pkg_mod.__path__ = [str(self.root / Path(*pkg_parts[:i + 1]))]
                 sys.modules[pkg] = pkg_mod
 
         for dep_name in ["prompts", "utils", "models", "config", "constants"]:

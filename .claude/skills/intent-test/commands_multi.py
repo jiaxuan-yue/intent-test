@@ -136,6 +136,15 @@ def cmd_run_multi(args):
             normalize_fn = fn
             break
 
+    # Load state mapping from config (Claude generates this)
+    # Maps generic state names → project-specific state names
+    # e.g. {"active": "collecting", "confirm_exit": "await_exit_confirm"}
+    state_mapping = {}
+    if hasattr(args, "config") and args.config:
+        from mock import load_config
+        config = load_config(args.config)
+        state_mapping = config.get("state_mapping", {})
+
     suite_path = Path(args.suite)
     if not suite_path.exists():
         exit_error(f"Suite not found: {suite_path}")
@@ -147,7 +156,7 @@ def cmd_run_multi(args):
     total_passed = total_failed = 0
 
     for scenario in suite.get("scenarios", []):
-        result = _run_scenario(scenario, handle_fn, normalize_fn, transitions)
+        result = _run_scenario(scenario, handle_fn, normalize_fn, transitions, state_mapping)
         scenario_results.append(result)
         if result["passed"]:
             total_passed += 1
@@ -176,14 +185,30 @@ def cmd_run_multi(args):
     exit_with_code(pass_rate)
 
 
-def _run_scenario(scenario, handle_fn, normalize_fn, transitions):
-    """Run a single multi-turn scenario."""
+def _run_scenario(scenario, handle_fn, normalize_fn, transitions, state_mapping=None):
+    """Run a single multi-turn scenario.
+
+    state_mapping: dict mapping generic state names to project-specific names.
+    e.g. {"active": "collecting", "confirm_exit": "await_exit_confirm"}
+    """
+    if state_mapping is None:
+        state_mapping = {}
+
+    def translate_state(generic_name):
+        """Translate generic state name to project-specific name."""
+        return state_mapping.get(generic_name, generic_name)
+
     initial = scenario.get("initial_state", {})
     current_session = initial.get("session") or initial.get("plan_session")
     has_context = initial.get("has_context", initial.get("has_plan", False))
+
+    # Translate initial state status if it uses generic names
+    if current_session and isinstance(current_session, dict) and "status" in current_session:
+        current_session["status"] = translate_state(current_session["status"])
+
     turn_results = []
     scenario_passed = True
-    prev_status = "idle"
+    prev_status = translate_state("idle")
 
     for i, turn in enumerate(scenario.get("turns", [])):
         try:
@@ -210,6 +235,11 @@ def _run_scenario(scenario, handle_fn, normalize_fn, transitions):
                     actual = current_session.get(key)
                 else:
                     actual = None
+
+                # Translate expected state names before comparison
+                if key == "status" and isinstance(expected, str):
+                    expected = translate_state(expected)
+
                 if expected == "not_null":
                     if actual is None:
                         turn_passed = False

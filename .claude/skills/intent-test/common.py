@@ -5,10 +5,24 @@ import json
 from pathlib import Path
 
 
+# Global project root override — set by CLI --project-root flag
+_project_root_override: Path = None
+
+
+def set_project_root(path: str):
+    """Set project root explicitly (called by CLI)."""
+    global _project_root_override
+    _project_root_override = Path(path).resolve()
+
+
 def resolve_project_root() -> Path:
-    """Auto-detect project root by scanning for common markers."""
+    """Return project root. Uses explicit override if set, otherwise auto-detect."""
+    if _project_root_override:
+        return _project_root_override
+
     current = Path(__file__).resolve().parent
     for _ in range(10):
+        # Strong signals first (actual source code directories)
         if any([
             (current / "src").is_dir(),
             (current / "app").is_dir(),
@@ -16,10 +30,13 @@ def resolve_project_root() -> Path:
             (current / "pyproject.toml").exists(),
             (current / "setup.py").exists(),
             (current / "setup.cfg").exists(),
+        ]):
+            return current
+        # Weak signals (could be sub-projects or tools)
+        if any([
             (current / "requirements.txt").exists(),
             (current / "Pipfile").exists(),
             (current / "poetry.lock").exists(),
-            (current / ".git").is_dir(),
         ]):
             return current
         current = current.parent

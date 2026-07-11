@@ -26,7 +26,7 @@ _this_dir = str(Path(__file__).resolve().parent)
 if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
 
-from common import resolve_project_root, output, exit_error, exit_with_code
+from common import resolve_project_root, output, exit_error, exit_with_code, set_project_root
 from mock import mock_all_dependencies, check_dependencies, load_config, apply_llm_mocks
 from extract import extract_keywords_from_prompts
 from adapters import (
@@ -50,6 +50,7 @@ def main():
         help="Adapter type (default: auto-detect)"
     )
     parser.add_argument("--adapter-path", help="Path for custom/llm_analyzer adapter")
+    parser.add_argument("--project-root", help="Project root directory (skip auto-detect)")
 
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -79,6 +80,7 @@ def main():
 
     p = sub.add_parser("run_multi", help="Run multi-turn FSM tests")
     p.add_argument("--suite", required=True)
+    p.add_argument("--config", help="Path to config.json (for state_mapping)")
     p.add_argument("--output", help="Save report to file")
 
     p = sub.add_parser("report_multi", help="Display multi-turn FSM report")
@@ -98,6 +100,10 @@ def main():
     p.add_argument("--reports", nargs="+", required=True, help="Report files to combine")
 
     args = parser.parse_args()
+
+    # Set project root if explicitly provided
+    if args.project_root:
+        set_project_root(args.project_root)
 
     commands = {
         "generate": cmd_generate,

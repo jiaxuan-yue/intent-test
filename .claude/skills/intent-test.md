@@ -56,9 +56,22 @@ Read the project's source code to build an architecture model. runner.py does NO
       "source": "app.core.task_plan.prompts"
     }
   },
-  "states": ["idle", "active", "confirm_exit", "await_offer", "await_confirm"]
+  "states": ["idle", "active", "confirm_exit", "await_offer", "await_confirm"],
+  "state_mapping": {
+    "active": "collecting",
+    "confirm_exit": "await_exit_confirm"
+  }
 }
 ```
+
+**CRITICAL: `state_mapping`** — Built-in scenarios use generic names (`active`, `confirm_exit`). Your project uses different names. Read the FSM code and map generic → project-specific. Without this, multi-turn tests fail on status comparisons.
+
+Generic → meaning:
+- `"active"` → system is collecting user input
+- `"confirm_exit"` → system asks "are you sure?"
+- `"idle"` → default/reset state
+- `"await_offer"` → system offers to start a flow
+- `"await_confirm"` → system asks for confirmation
 
 Mock strategies for LLM functions:
 - `"keyword_fallback"` — replace LLM call with keyword matching
@@ -163,9 +176,10 @@ python .claude/skills/intent-test/runner.py run \
   --suite tests/generated/keywords.json --adapter dialog \
   --output tests/generated/layer3_report.json
 
-# Layer 2: multi-turn FSM with state injection
+# Layer 2: multi-turn FSM with state injection + state mapping
 python .claude/skills/intent-test/runner.py run_multi \
   --suite tests/generated/fsm_multi.json --adapter dialog \
+  --config tests/generated/config.json \
   --output tests/generated/layer2_report.json
 
 # Layer 1: LLM routing with mock

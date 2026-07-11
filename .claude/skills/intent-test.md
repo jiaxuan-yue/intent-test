@@ -34,14 +34,13 @@ grep -rl "intent\|keyword_rule\|match.*intent\|recognize\|classify\|detect_inten
 
 **Step 3 — Read and classify architecture.** Read discovered files and determine which architecture type(s) the project uses:
 
-| Architecture | Signs | How to call it |
-|-------------|-------|----------------|
-| **Class-based engine** | `class RuleEngine`, `class IntentClassifier`, `engine.match(input)` | Instantiate class, call `.match()` |
-| **Function-based** | `def detect_intent()`, `def _detect_plan_intent()`, `def classify()` | Call function directly |
-| **LLM-driven analyzer** | `analyzer_node`, `ExecutionPlan`, LLM prompt chains, boolean plan fields | Call analyzer, extract intent from structured output |
-| **Dialog state machine** | `dialog.py`, state transitions, `_detect_*_intent()` private functions | Call detection functions with context |
-| **Config-driven** | JSON/YAML files mapping keywords to intents | Load config, do keyword matching |
-| **Hybrid** | Combination of above (e.g., keywords first → LLM fallback) | Call primary system, note fallback behavior |
+| Architecture | Signs | runner.py adapter | How to call |
+|-------------|-------|-------------------|-------------|
+| **Class-based engine** | `class RuleEngine`, `engine.match(input)` | `--adapter rule_engine` | Instantiate class, call `.match()` |
+| **Function-based dialog** | `dialog.py`, `_detect_*_intent()`, `_is_yes()`, `_is_no()` | `--adapter dialog` | Call each detection function individually |
+| **Two-layer hybrid** | LLM `analyzer_node` + keyword `dialog.py` | `--adapter dialog` (Layer 2) | Test keyword layer directly; LLM layer needs manual review |
+| **LLM-only analyzer** | `ExecutionPlan`, prompt chains, no keyword rules | `--adapter custom` | Generate adapter that calls LLM analyzer |
+| **Config-driven** | JSON/YAML keyword→intent mapping | `--adapter custom` | Load config, implement matching in adapter |
 
 **Step 4 — Build intent model.** Extract:
 - All intent names/enums (from code or config)
@@ -51,18 +50,24 @@ grep -rl "intent\|keyword_rule\|match.*intent\|recognize\|classify\|detect_inten
 - Fallback behavior (None? LLM call? clarification?)
 - Context/state dependencies (does recognition depend on dialog state?)
 
-**Step 5 — Generate adapter.** Write `tests/generated/adapter.py` that bridges the test runner with the discovered system. The adapter must define one function:
+For **two-layer architectures** (e.g., ChatTutor):
+- **Layer 1 (LLM Analyzer)**: `analyzer_node` → outputs `ExecutionPlan` with boolean fields. Cannot be unit-tested without LLM API access — note this as a limitation.
+- **Layer 2 (Keyword Dialog)**: `dialog.py` → `_detect_plan_intent()`, `_is_learn_intent()`, `_is_yes()`, `_is_no()`, `_is_exit_intent()`, etc. Fully testable with runner.py.
+- **Testing strategy**: Use `--adapter dialog` to test Layer 2 exhaustively. For Layer 1, generate test inputs and document expected LLM outputs for manual/CI review.
 
+**Step 5 — Choose adapter and generate if needed.**
+
+runner.py supports three built-in adapter types:
+- `--adapter dialog` — auto-loads `dialog.py`, mocks heavy deps (langchain_core, langgraph), tests all `_detect_*` functions
+- `--adapter rule_engine` — imports `RuleEngine` class from `intent_recognition.engine`
+- `--adapter custom --adapter-path adapter.py` — loads user-provided adapter
+- `--adapter auto` (default) — tries dialog first, then rule_engine
+
+For architectures not covered by built-in adapters, generate `tests/generated/adapter.py`:
 ```python
 def match(input_text: str) -> dict:
-    """
-    Returns: {"intent": str|None, "confidence": float, "details": {...}}
-    """
-    # Call the project's actual intent recognition API
-    # (Claude writes the correct calls based on what it discovered)
+    """Returns: {"intent": str|None, "confidence": float, "details": {...}}"""
 ```
-
-This adapter is the key to universal compatibility — it translates whatever the project's API looks like into a standard interface.
 
 **Step 6 — Fallback if nothing found.** If Steps 1-4 find zero intent code:
 - Ask user to point to the module or provide intents as JSON
@@ -93,18 +98,37 @@ Write test suite to `{output_dir}/{suite_name}.json`.
 
 ### Phase 3: Execute Tests
 
-Run the test suite through the adapter:
+Run the test suite through the adapter. Choose the correct adapter flag based on Phase 1 discovery:
 
 ```bash
+# Dialog/function-based projects (ChatTutor, etc.)
 python .claude/skills/intent-test/runner.py run \
   --suite tests/generated/intent_tests.json \
-  --adapter tests/generated/adapter.py \
+  --adapter dialog \
+  --output tests/generated/intent_tests_report.json
+
+# Class-based RuleEngine projects
+python .claude/skills/intent-test/runner.py run \
+  --suite tests/generated/intent_tests.json \
+  --adapter rule_engine \
+  --output tests/generated/intent_tests_report.json
+
+# Custom adapter
+python .claude/skills/intent-test/runner.py run \
+  --suite tests/generated/intent_tests.json \
+  --adapter custom --adapter-path tests/generated/adapter.py \
+  --output tests/generated/intent_tests_report.json
+
+# Auto-detect (tries dialog → rule_engine → custom)
+python .claude/skills/intent-test/runner.py run \
+  --suite tests/generated/intent_tests.json \
   --output tests/generated/intent_tests_report.json
 ```
 
-The runner loads the adapter, calls `match()` for each test case, and produces a standardized report.
-
-If runner.py is unavailable or the project has unusual requirements, execute tests directly via Bash with an inline Python script that imports the adapter.
+Display readable report:
+```bash
+python .claude/skills/intent-test/runner.py report --results tests/generated/intent_tests_report.json
+```
 
 ### Phase 4: Analyze Results
 

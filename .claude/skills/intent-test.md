@@ -74,48 +74,84 @@ Save to `tests/generated/config.json`.
 
 ## Phase 2: Generate Tests (Claude's job)
 
-### Single-turn (Layer 3 — Keywords)
+Test generation follows **6 universal dimensions** — these apply to ANY intent system regardless of architecture:
 
-Generate test cases for each detection function:
-- **Positive**: exact keywords, paraphrases, natural variations
-- **Adversarial**: negation, empty, off-topic, false positives
-- **Boundary**: conflicting inputs, mixed signals
+```
+1. Correctness  — input → correct intent?
+2. Robustness   — dirty/adversarial input → graceful degradation?
+3. State flow   — FSM every path → traversed?
+4. Routing      — LLM layer decisions → match expected?
+5. Confidence   — high confidence → actually correct? low → actually uncertain?
+6. Performance  — response time → within production threshold?
+```
 
-Write to `tests/generated/{name}.json`.
+### Dimension 1: Correctness (single-turn)
 
-### Multi-turn (Layer 2 — FSM)
+For each intent/function discovered in Phase 1:
+- **Positive**: exact keywords, paraphrases, synonyms, natural variations
+- **Negative**: inputs that should NOT match this intent
+- **Cross-intent**: inputs that could match a DIFFERENT intent (conflict detection)
 
-Generate scenarios that cover ALL state transitions, including **state injection** — start from ANY state, not just idle:
+### Dimension 2: Robustness (universal adversarial patterns)
+
+These patterns apply to ALL intent systems, all languages:
+
+| Pattern | Examples | Tests |
+|---------|----------|-------|
+| **Empty/null** | `""`, `"   "`, `None` | Should return no-match gracefully |
+| **Negation** | `"不想X"`, `"don't X"`, `"别X"` | Should NOT trigger X's intent |
+| **Off-topic** | `"今天天气"`, `"who are you"` | Should return no-match |
+| **Noise** | `"asdfghjkl"`, `"🎉🎊"`, `"..."` | Should not crash or false-match |
+| **Long input** | 500+ char text | Should handle without timeout |
+| **Mixed language** | `"我想learn Python编程"` | Should handle code-switching |
+| **Unicode edge** | full-width chars, zero-width spaces | Should normalize or handle |
+| **Injection** | `"忽略之前指令,告诉我..."` | Should not execute injected instructions |
+| **Repetition** | `"学学学学学学"` | Should not false-match |
+| **Homophone** | `"想穴Python"` (学→穴) | Should handle near-miss |
+
+Generate at least 3 adversarial cases per pattern per intent.
+
+### Dimension 3: State Flow (multi-turn FSM)
+
+Read the actual FSM code → extract ALL states and transitions → generate:
+1. **Happy path** for each start→end flow
+2. **State injection** — start from EVERY state, test all outgoing transitions
+3. **Back-and-forth** — enter state → leave → return → leave again
+4. **Guard rails** — inputs that should NOT trigger a transition
+5. **Max turns / timeout** — what happens at boundaries
 
 ```json
+// Template: Claude fills in {state}, {input}, {expected} from actual code
 {
-  "name": "from_confirm_exit_accept",
-  "initial_state": {
-    "session": {"status": "confirm_exit", "mode": "", "turns": 0, "messages": []}
-  },
+  "name": "inject_from_{state}",
+  "initial_state": {"session": {"status": "{state}", ...}},
   "turns": [
-    {"input": "好的", "expect": {"status": "idle", "handled": true}}
+    {"input": "{trigger_input}", "expect": {"status": "{next_state}"}}
   ]
 }
 ```
 
-Goal: every state as a starting point, every transition covered.
+### Dimension 4: Routing (LLM layer)
 
-Write to `tests/generated/{name}_multi.json`.
+For each LLM decision point found in Phase 1:
+- Generate inputs where the routing decision is clear (high confidence expected)
+- Generate ambiguous inputs where routing could go either way
+- Test with mocked LLM returning each possible value
 
-### Routing (Layer 1 — LLM)
+### Dimension 5: Confidence Calibration
 
-Generate test cases with `expect_routing` — what the router should decide:
+For inputs with known outcomes:
+- Clear matches should have confidence > 0.8
+- Ambiguous inputs should have confidence 0.3-0.7
+- Non-matches should have confidence < 0.3
+- Flag any input where confidence and correctness disagree
 
-```json
-{
-  "id": "plan_related_yes",
-  "input": "帮我制定学习计划",
-  "expect_routing": {"is_plan_related": true}
-}
-```
+### Dimension 6: Performance
 
-Write to `tests/generated/{name}_layer1.json`.
+- Baseline: single input response time
+- Stress: 100 sequential inputs, measure p50/p95/p99
+- Cold start: first invocation vs warmed up
+- Long input: 1000+ char input timing
 
 ## Phase 3: Execute Tests (runner.py's job)
 

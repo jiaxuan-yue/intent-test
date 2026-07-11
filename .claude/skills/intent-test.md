@@ -217,54 +217,53 @@ Failure: wrong_match
   Fix pattern: narrow_keyword
 ```
 
-## Phase 5: Suggest & Apply Fixes (Claude's job)
+## Phase 5: Generate Fix Report (Claude's job)
 
-Generate fixes using **universal fix patterns** — these work regardless of architecture:
+After analyzing failures in Phase 4, generate a **fix report** — a structured Markdown document with prioritized suggestions. Do NOT apply fixes directly; the user decides what to change.
 
-| Fix pattern | When to apply | How |
-|-------------|--------------|-----|
-| `narrow_keyword` | `false_positive` — keyword too broad | Remove single-char keywords, add context requirement, or require word boundary |
-| `add_negation_guard` | `negation_miss` — negation not handled | Add `if is_no(input): return False` check BEFORE keyword match |
-| `disambiguate_keywords` | `wrong_match` — two intents share keywords | Add distinguishing keywords unique to each intent, remove shared ones |
-| `add_guard_condition` | `state_leak` — wrong transition triggered | Add pre-condition check (e.g., only transition if `turns > 0`) |
-| `relax_condition` | `state_stuck` — transition not triggering | Loosen the condition or add alternative trigger keywords |
-| `calibrate_threshold` | `confidence_wrong` — scoring misaligned | Adjust confidence threshold up/down, or change scoring weights |
-| `align_prompt` | `routing_disagree` — LLM and keywords disagree | Update LLM prompt to include keyword definitions, or add guardrail |
-| `add_fallback` | `no_match` on valid inputs | Add catch-all pattern or LLM fallback for unrecognized inputs |
-| `add_regression` | Any fix applied | Add the failing input as a regression test case |
+**Report structure:**
 
-**Fix workflow:**
+```markdown
+# Intent Recognition Fix Report
 
+## Summary
+- Total failures: N
+- Top root cause: negation_miss (X% of failures)
+- Estimated fix impact: applying top 3 fixes resolves ~Y% of failures
+
+## Priority 1: negation_miss (23 failures)
+**What:** "不想X" triggers X's intent because negation isn't checked first.
+**Where:** dialog.py — _is_learn_intent(), _is_update_intent(), _is_exit_intent()
+**Suggestion:** Add negation guard before keyword match:
+  ```python
+  def _is_learn_intent(text: str) -> bool:
+      if _is_no(text):      # ← add this
+          return False       # ← add this
+      return any(kw in text for kw in LEARN_KEYWORDS)
+  ```
+
+## Priority 2: false_positive (15 failures)
+**What:** Single-char keywords ("天", "周") match unrelated inputs.
+**Where:** prompts.py — TIME_KEYWORDS line 42
+**Suggestion:** Remove single-char keywords or require word boundary.
+
+## Priority 3: state_stuck (8 failures)
+**What:** FSM stays in collecting after user provides enough info.
+**Where:** dialog.py — handle_plan_chat() transition condition
+**Suggestion:** Check _has_enough_info() before requiring more turns.
 ```
-1. Sort failures by frequency (most common pattern first)
-2. For each pattern:
-   a. Show the failing inputs grouped by root cause
-   b. Show the specific code location
-   c. Propose the fix with a diff preview
-   d. If user approves: apply fix via Edit tool
-   e. Add failing inputs to regression test suite
-3. Re-run affected tests to verify fix
-4. Repeat until pass_rate improves or all fixable issues resolved
-```
 
-**Example output:**
+**For each issue in the report, include:**
 
-```
-🔴 Top issue: negation_miss (23 failures, 34% of all failures)
+| Field | Content |
+|-------|---------|
+| **Priority** | P0/P1/P2 based on failure frequency |
+| **What** | One-sentence description of the bug |
+| **Where** | File name + function/line |
+| **Suggestion** | Concrete code snippet showing the fix direction |
+| **Affected inputs** | 2-3 example failing inputs |
 
-  Affected functions: _is_learn_intent, _is_update_intent, _is_exit_intent
-  
-  Fix: Add negation guard to each function
-  ─── a/dialog.py ───
-  +++ b/dialog.py ───
-  @@ -42,6 +42,8 @@
-   def _is_learn_intent(text: str) -> bool:
-  +    if _is_no(text):
-  +        return False
-       return any(kw in text for kw in LEARN_KEYWORDS)
-
-  Apply? [y/N]
-```
+Save to `tests/generated/{name}_fix_report.md`.
 
 ## Output Files
 
@@ -276,7 +275,7 @@ Generate fixes using **universal fix patterns** — these work regardless of arc
 | `{name}_layer1.json` | Claude | Routing test suite |
 | `layer{1,2,3}_report.json` | runner.py | Per-layer test results |
 | `unified_report.json` | runner.py | Combined layered report |
-| `regression.json` | Claude | Accumulated failing inputs (grows with each fix cycle) |
+| `{name}_fix_report.md` | Claude | Fix suggestions with code examples |
 
 ## Parameters
 

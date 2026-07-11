@@ -1,296 +1,209 @@
 ---
 name: intent-test
-description: "Automated testing for any intent recognition system — auto-discovers your architecture (LLM-driven, rule-based, function-based, hybrid), generates 7 types of test cases, runs tests, analyzes failures, and suggests fixes. Use when: testing intent recognition accuracy, adding new intents, optimizing rules, discovering edge cases, regression testing, or CI/CD intent validation."
+description: "Automated testing for any intent recognition system. Claude reads code → understands architecture → generates config + tests → runner.py executes → Claude analyzes failures. Supports LLM routing layers, FSM dialog state machines, keyword matchers, and hybrid systems."
 ---
 
 # Intent Recognition Testing
 
-Test **any** intent recognition system end-to-end: discover → generate → execute → analyze → fix.
+Two-layer architecture: **Claude is the intelligence, runner.py is the executor.**
 
-Works with all architectures: rule engines, LLM analyzers, keyword matchers, dialog state machines, function-based classifiers, and hybrid systems.
-
-## Workflow
-
-### Phase 1: Auto-Discover the Intent System
-
-**Step 1 — Broad file discovery.** Scan the project to find intent-related code:
-
-```bash
-# File names
-find . -type f -name "*.py" | grep -iE "intent|engine|recogni|classify|nlp|router|dialog|analyzer|agent|plan"
-
-# Config files with intent definitions
-find . -type f \( -name "*.json" -o -name "*.yaml" -o -name "*.yml" \) | grep -iE "intent|rule|keyword|config"
-
-# Directory names
-find . -type d | grep -iE "intent|engine|nlp|recogni|dialog|agent"
+```
+Claude (understanding)              runner.py (execution)
+┌──────────────────────┐           ┌───────────────────────┐
+│ Phase 1: Read code   │──────────▶│ config.json           │
+│ Phase 2: Generate    │           │ test scenarios        │
+│ Phase 5: Analyze     │◀──────────│ test reports          │
+└──────────────────────┘           └───────────────────────┘
 ```
 
-**Step 2 — Keyword scan.** Grep for intent-related code patterns:
+## Phase 1: Read and Understand the Code (Claude's job)
 
-```bash
-grep -rl "intent\|keyword_rule\|match.*intent\|recognize\|classify\|detect_intent\|plan_intent" --include="*.py" .
+Read the project's source code to build an architecture model. runner.py does NOT do this — you do.
+
+**Step 1 — Discover the codebase.** Use Read/Bash to find and read:
+- Dialog/FSM files: `dialog.py`, `state_machine.py`, `fsm.py`
+- LLM analyzer files: `analyzer.py`, `agent_builder.py`, `prompts.py`
+- Engine files: `engine.py`, `recognizer.py`, `classifier.py`
+- Config files: any JSON/YAML defining intents or keywords
+
+**Step 2 — Classify architecture layers.** Identify which layers exist:
+
+| Layer | Signs | How to test |
+|-------|-------|-------------|
+| **L1: LLM Routing** | `analyzer_node()`, `ExecutionPlan`, prompt chains | `run_layer1` with LLM mocks |
+| **L2: FSM Dialog** | `handle_*_chat()`, state transitions, `_detect_*_intent()` | `run_multi` with state injection |
+| **L3: Keywords** | keyword lists, `_is_yes()`, `_is_no()`, regex patterns | `run` / `quick` single-turn |
+
+**Step 3 — Generate config.json.** Write the architecture config that runner.py will read:
+
+```json
+{
+  "architecture": "hybrid",
+  "layers": {
+    "routing": {
+      "entry": "app.core.agent_builder.analyzer_node",
+      "llm_mocks": {
+        "_is_plan_related_llm": "keyword_fallback",
+        "_should_exit_llm": "keyword_fallback"
+      },
+      "params": {"task_id": "test"}
+    },
+    "dialog": {
+      "entry": "app.core.task_plan.dialog.handle_plan_chat",
+      "params": {"task_id": "test", "existing_plan": null}
+    },
+    "keywords": {
+      "source": "app.core.task_plan.prompts"
+    }
+  },
+  "states": ["idle", "active", "confirm_exit", "await_offer", "await_confirm"]
+}
 ```
 
-**Step 3 — Read and classify architecture.** Read discovered files and determine which architecture type(s) the project uses:
+Mock strategies for LLM functions:
+- `"keyword_fallback"` — replace LLM call with keyword matching
+- `"return_true"` / `"return_false"` — fixed boolean
+- `"return:VALUE"` — return specific JSON value
 
-| Architecture | Signs | runner.py adapter | Adapter class |
-|-------------|-------|-------------------|---------------|
-| **Function-based dialog** | `dialog.py`, `_detect_*_intent()`, `_is_yes()`, async handler functions | `--adapter dialog` | `DialogFunctionsAdapter` |
-| **Class-based engine** | `class RuleEngine`, `engine.match(input)` | `--adapter rule_engine` | `RuleEngineAdapter` |
-| **LLM structured output** | Pydantic `BaseModel` output, prompt chains | `--adapter llm_analyzer` | `LLMAnalyzerAdapter` |
-| **Two-layer hybrid** | LLM analyzer layer + keyword dialog layer | `--adapter dialog` (Layer 2) | `DialogFunctionsAdapter` |
-| **Custom** | Any other architecture | `--adapter custom` | `CustomAdapter` |
-| **Auto-detect** | Unknown | `--adapter auto` (default) | tries dialog → rule_engine |
+Save to `tests/generated/config.json`.
 
-All adapters implement `BaseAdapter` interface:
-- `detect_intents(input, context)` — unified detection result
-- `get_keyword_sets()` — keywords for auto test generation
-- `get_all_functions()` — list of testable functions
-- `get_handle_fn()` — multi-turn handler if available
+**Step 4 — Extract state graph.** Read FSM code to identify:
+- All states and their transition conditions
+- Which transitions are triggered by keywords vs LLM
+- Which states can be starting points for test scenarios
 
-**Step 4 — Build intent model.** Extract:
-- All intent names/enums (from code or config)
-- Keywords mapped to each intent
-- Matching logic (exact, regex, fuzzy, embedding, LLM)
-- Confidence scoring mechanism
-- Fallback behavior (None? LLM call? clarification?)
-- Context/state dependencies (does recognition depend on dialog state?)
+## Phase 2: Generate Tests (Claude's job)
 
-For **two-layer architectures** (LLM Analyzer + Keyword Dialog):
-- **Layer 1 (LLM Analyzer)**: Outputs structured data with intent fields. Cannot be unit-tested without LLM API access — note this as a limitation.
-- **Layer 2 (Keyword Dialog)**: `dialog.py` with `_detect_*_intent()`, `_is_yes()`, `_is_no()`, `_is_exit_intent()`, etc. Fully testable with runner.py.
-- **Testing strategy**: Use `--adapter dialog` to test Layer 2 exhaustively. For Layer 1, generate test inputs and document expected LLM outputs for manual/CI review.
+### Single-turn (Layer 3 — Keywords)
 
-**Step 5 — Choose adapter and generate if needed.**
+Generate test cases for each detection function:
+- **Positive**: exact keywords, paraphrases, natural variations
+- **Adversarial**: negation, empty, off-topic, false positives
+- **Boundary**: conflicting inputs, mixed signals
 
-runner.py supports five adapter types via class-based `BaseAdapter` architecture:
-- `--adapter dialog` — `DialogFunctionsAdapter`: auto-loads `dialog.py`, mocks heavy deps, tests all detection functions + multi-turn async handlers
-- `--adapter rule_engine` — `RuleEngineAdapter`: imports `RuleEngine` class
-- `--adapter llm_analyzer` — `LLMAnalyzerAdapter`: loads LLM structured output via adapter-path
-- `--adapter custom --adapter-path adapter.py` — `CustomAdapter`: user-provided `match()` function
-- `--adapter auto` (default) — tries `DialogFunctionsAdapter` → `RuleEngineAdapter`
+Write to `tests/generated/{name}.json`.
 
-For new architectures, write a ~50 line adapter implementing `BaseAdapter`.
+### Multi-turn (Layer 2 — FSM)
 
-**Step 6 — Fallback if nothing found.** If Steps 1-4 find zero intent code:
-- Ask user to point to the module or provide intents as JSON
-- Generate adapter from user-provided intents using simple keyword matching
+Generate scenarios that cover ALL state transitions, including **state injection** — start from ANY state, not just idle:
 
-### Phase 2: Generate Test Cases
-
-Generate test cases across 7 categories. For each intent, produce cases proportionally:
-
-| Type | Purpose | Count per intent | Priority |
-|------|---------|-----------------|----------|
-| **Positive** | Correct recognition with clear keywords | 3-5 | P0 |
-| **Boundary** | Ambiguous inputs, multi-intent overlap | 2-3 | P1 |
-| **Adversarial** | Negations ("不想学"), typos ("pythn"), irrelevant noise | 3-5 | P1 |
-| **Regression** | Previously failed cases (load from file if available) | All | P0 |
-| **Performance** | Response time under threshold | 1-2 | P2 |
-| **Multi-turn** | Conversation context shifts, FSM state transitions | 12 scenarios | P1 |
-| **Context-aware** | State-dependent recognition | 1-2 | P2 |
-
-**Generation rules:**
-- Positive: exact keywords, paraphrases, natural variations
-- Boundary: inputs matching multiple intents, partial keyword matches
-- Adversarial: negation prefixes (不/没/非), character swaps, redundant text, unrelated inputs
-- For Chinese intents: simplified/traditional variants, pinyin homophones
-- For LLM-driven systems: test cases where keyword rules and LLM might disagree
-
-Write test suite to `{output_dir}/{suite_name}.json`.
-
-### Phase 3: Execute Tests
-
-Run the test suite through the adapter. Choose the correct adapter flag based on Phase 1 discovery:
-
-```bash
-# Dialog/function-based projects
-python .claude/skills/intent-test/runner.py run \
-  --suite tests/generated/intent_tests.json \
-  --adapter dialog \
-  --output tests/generated/intent_tests_report.json
-
-# Class-based RuleEngine projects
-python .claude/skills/intent-test/runner.py run \
-  --suite tests/generated/intent_tests.json \
-  --adapter rule_engine \
-  --output tests/generated/intent_tests_report.json
-
-# Custom adapter
-python .claude/skills/intent-test/runner.py run \
-  --suite tests/generated/intent_tests.json \
-  --adapter custom --adapter-path tests/generated/adapter.py \
-  --output tests/generated/intent_tests_report.json
-
-# Auto-detect (tries dialog → rule_engine → custom)
-python .claude/skills/intent-test/runner.py run \
-  --suite tests/generated/intent_tests.json \
-  --output tests/generated/intent_tests_report.json
+```json
+{
+  "name": "from_confirm_exit_accept",
+  "initial_state": {
+    "session": {"status": "confirm_exit", "mode": "", "turns": 0, "messages": []}
+  },
+  "turns": [
+    {"input": "好的", "expect": {"status": "idle", "handled": true}}
+  ]
+}
 ```
 
-Display readable report:
-```bash
-python .claude/skills/intent-test/runner.py report --results tests/generated/intent_tests_report.json
+Goal: every state as a starting point, every transition covered.
+
+Write to `tests/generated/{name}_multi.json`.
+
+### Routing (Layer 1 — LLM)
+
+Generate test cases with `expect_routing` — what the router should decide:
+
+```json
+{
+  "id": "plan_related_yes",
+  "input": "帮我制定学习计划",
+  "expect_routing": {"is_plan_related": true}
+}
 ```
 
-#### Multi-Turn State Machine Testing
+Write to `tests/generated/{name}_layer1.json`.
 
-For projects with dialog state machines (FSM with multiple states and transitions), use the dedicated multi-turn commands:
+## Phase 3: Execute Tests (runner.py's job)
+
+runner.py reads the config Claude generated and executes:
 
 ```bash
-# Generate 12 built-in FSM scenarios (covers all state transitions)
-python .claude/skills/intent-test/runner.py generate_multi --name plan_fsm
+# Layer 3: single-turn keyword testing
+python .claude/skills/intent-test/runner.py run \
+  --suite tests/generated/keywords.json --adapter dialog \
+  --output tests/generated/layer3_report.json
 
-# Execute multi-turn scenarios
+# Layer 2: multi-turn FSM with state injection
 python .claude/skills/intent-test/runner.py run_multi \
-  --suite tests/generated/plan_fsm_multi.json \
-  --adapter dialog \
-  --output tests/generated/plan_fsm_multi_report.json
+  --suite tests/generated/fsm_multi.json --adapter dialog \
+  --output tests/generated/layer2_report.json
 
-# Display state transition coverage report
-python .claude/skills/intent-test/runner.py report_multi \
-  --results tests/generated/plan_fsm_multi_report.json
+# Layer 1: LLM routing with mock
+python .claude/skills/intent-test/runner.py run_layer1 \
+  --suite tests/generated/routing.json \
+  --config tests/generated/config.json \
+  --output tests/generated/layer1_report.json
+
+# Unified report: combine all layers
+python .claude/skills/intent-test/runner.py report_unified \
+  --reports tests/generated/layer1_report.json \
+           tests/generated/layer2_report.json \
+           tests/generated/layer3_report.json
 ```
 
-**How it works:**
-- 12 built-in scenarios cover all 6 FSM states and major transition paths
-- Each scenario chains multiple turns, passing session state between calls
-- LLM dependencies are mocked: async LLM calls raise → fallback to default questions
-- `asyncio.run()` wraps async handler calls
-- Validates status, mode, handled flag, and turn count after each turn
+runner.py capabilities:
+- **Auto-detect functions** via `inspect.signature()` — single str param = detector
+- **Auto-build call kwargs** from function signature — no hardcoded variants
+- **Auto-discover handlers** by message+session parameter pattern
+- **Auto-compute package paths** from `__init__.py` chains
+- **LLM mock** — monkey-patches LLM functions per config strategies
+- **State injection** — scenarios start from any FSM state with full session object
 
-### Phase 4: Analyze Results
+## Phase 4: Analyze Results (Claude's job)
 
-Compute and present:
+Read the reports runner.py produced. Analyze:
 
-1. **Summary:** `Total: N | Passed: N (XX%) | Failed: N | Errors: N`
+1. **Layer-specific pass rates** — which layer has the most failures?
+2. **Failure root causes** — keyword conflict? LLM routing error? FSM logic bug?
+3. **State transition coverage** — which paths are uncovered?
+4. **Architecture-aware suggestions** — fix keywords vs fix prompts vs fix FSM logic
 
-2. **Failure classification** by root cause:
-   - 🔴 Confidence too low — matched correct intent but below threshold
-   - 🟠 Wrong intent — keyword conflict between intents
-   - 🟡 No match — system returned None/unrecognized
-   - 🔵 LLM disagreement — keyword layer and LLM layer gave different results (hybrid systems)
-   - 🟢 Timeout — exceeded performance threshold
+## Phase 5: Suggest & Apply Fixes (Claude's job)
 
-3. **Keyword conflict matrix** — overlapping keywords between intents
+Generate fixes targeted at the correct layer:
 
-4. **Coverage gaps** — which intents lack test coverage
-
-5. **State transition coverage** (multi-turn tests):
-   ```
-   State Transition Coverage:
-     idle → collecting:         3/3 ✅
-     collecting → await_exit:   2/2 ✅
-     await_exit → idle:         1/1 ✅
-     await_exit → collecting:   1/1 ✅
-     ...
-   Uncovered: 2 transitions
-   ```
-   Warn if any major transition path has zero coverage.
-
-### Phase 5: Suggest & Apply Fixes
-
-Generate **architecture-aware** suggestions:
-
-| Architecture | Fix types |
-|-------------|-----------|
-| Rule engine | Add keywords, adjust weights, add negation patterns |
-| Function-based | Add detection cases, modify return logic |
-| LLM-driven | Adjust prompts, refine output parsing, add guardrail rules |
-| Dialog state machine | Add state transitions, fix context-dependent detection |
-| Config-driven | Update keyword mappings, add conflict resolution rules |
-| Hybrid | Fix keyword layer, adjust LLM fallback threshold, reconcile conflicts |
-
-**Auto-fix** (if user requests):
-1. Show preview of changes (dry-run first)
-2. Apply changes using Edit tool to the project's actual source files
-3. Re-run affected test cases to verify
+| Layer | Fix types |
+|-------|-----------|
+| L1 Routing | Adjust LLM prompts, refine output parsing, add keyword guardrails |
+| L2 FSM | Fix state transition logic, add missing transitions, handle edge states |
+| L3 Keywords | Add/remove keywords, fix negation handling, resolve conflicts |
 
 ## Output Files
 
-Write all outputs to the configured output directory (default: `tests/generated/`):
-
-| File | Content |
-|------|---------|
-| `adapter.py` | Auto-generated adapter for the project's intent system |
-| `{name}.json` | Single-turn test suite definition |
-| `{name}_report.json` | Single-turn test results with timing |
-| `{name}_multi.json` | Multi-turn FSM scenario definitions |
-| `{name}_multi_report.json` | Multi-turn results with state transition coverage |
-| `{name}_summary.md` | Markdown analysis report |
-| `{name}_fixes.md` | Applied fixes changelog (if auto-fix ran) |
+| File | Produced by | Content |
+|------|------------|---------|
+| `config.json` | Claude | Architecture config for runner.py |
+| `{name}.json` | Claude | Single-turn test suite |
+| `{name}_multi.json` | Claude | Multi-turn FSM scenarios |
+| `{name}_layer1.json` | Claude | Routing test suite |
+| `layer{1,2,3}_report.json` | runner.py | Per-layer test results |
+| `unified_report.json` | runner.py | Combined layered report |
 
 ## Parameters
 
-Parse from user's skill invocation (e.g., `/intent-test mode=analyze auto_fix=true`):
-
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `mode` | `analyze` | `generate` / `run` / `analyze` / `quick` / `fix` / `research` / `generate_multi` / `run_multi` / `analyze_multi` / `check_deps` / `fsm_coverage` |
-| `intents` | auto-detect | JSON string of custom intents (fallback if no code found) |
+| `mode` | `analyze` | `generate` / `run` / `analyze` / `quick` / `research` / `generate_multi` / `run_multi` / `run_layer1` / `report_unified` |
+| `config` | auto-detect | Path to architecture config.json |
 | `name` | `intent_tests` | Suite name |
 | `output_dir` | `tests/generated` | Output directory |
-| `auto_fix` | `false` | Apply fixes automatically |
-| `dry_run` | `true` | Preview fixes without applying |
-| `max_fixes` | `5` | Maximum fixes to apply |
-| `input` | — | Single input for `quick` mode |
-| `context` | — | State context JSON for `quick` mode (e.g. `'{"status": "collecting"}'`) |
-| `regression_file` | — | Path to regression test cases |
-| `performance_threshold` | — | Max response time in ms |
 
-## Quick Mode
+## Key Design Principles
 
-For `mode=quick`:
-1. Use existing adapter or auto-detect
-2. Call `adapter.detect_intents(input, context)` on the provided input
-3. Show: detected intent, confidence, matched keywords/patterns
-4. If confidence < 0.5, suggest LLM fallback or rule improvement
-
-**Context-aware testing** — test detection in a specific dialog state:
-```bash
-python .claude/skills/intent-test/runner.py quick \
-  --input "继续" --context '{"status": "await_exit_confirm"}' --adapter dialog
-```
-
-## Utility Commands
-
-### check_deps — Dependency diagnostics
-
-Check which project dependencies are available, mocked, or missing:
-```bash
-python .claude/skills/intent-test/runner.py check_deps
-```
-Mocked: langchain_core, langgraph, langchain_openai, langchain_deepseek, openai, anthropic, pydantic.
-
-### fsm_coverage — FSM state transition analysis
-
-Analyze the project's state machine and show coverage:
-```bash
-python .claude/skills/intent-test/runner.py fsm_coverage --adapter dialog
-```
-
-## Exit Codes
-
-| Code | Meaning |
-|------|---------|
-| `0` | All tests passed |
-| `1` | Some failures, pass_rate ≥ 0.5 |
-| `2` | Heavy failures, pass_rate < 0.5 |
-| `3` | Runtime error (import failure, etc.) |
-
-## Research Mode
-
-For `mode=research`, produce a comprehensive report:
-- Coverage matrix (intent × test type)
-- Failure root cause analysis with code references
-- Architecture-specific improvement roadmap (short/mid/long term)
-- Comparison with previous runs (if reports exist)
+1. **Claude reads code, runner.py doesn't** — understanding architecture is Claude's job
+2. **Config-driven mock** — Claude generates config.json telling runner.py how to mock LLM
+3. **State injection** — multi-turn scenarios start from ANY state, not just idle
+4. **Signature-based detection** — runner.py uses `inspect.signature()`, never hardcoded names
+5. **Layered testing** — L1 routing + L2 FSM + L3 keywords, unified report
 
 ## Tips
 
-- Start with `analyze` mode for first-time testing
-- The adapter is auto-generated — review it before CI/CD use
-- For hybrid systems, test both layers (keyword + LLM) independently
-- After fixes, re-run with regression file to verify
-- For CI/CD: check `pass_rate` in report JSON, fail if < threshold
+- Always start with `/intent-test mode=analyze` — Claude reads code and generates everything
+- Review `config.json` before running — it describes how runner.py will mock and test
+- Use `report_unified` to see all layers at once
+- For CI/CD: check each layer's pass_rate independently
+- State injection scenarios catch bugs that idle-start scenarios miss

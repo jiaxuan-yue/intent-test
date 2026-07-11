@@ -1,31 +1,33 @@
 #!/usr/bin/env python3
 """
-Intent Recognition Test Runner — universal adapter for any intent system.
+Intent Recognition Test Runner — execution layer only.
+
+This script ONLY executes tests. Understanding the codebase and generating
+tests/configs is Claude's job (the intelligence layer).
 
 Architecture:
-    BaseAdapter (interface)
-    ├── DialogFunctionsAdapter   — function-based (dialog.py, _detect_*_intent)
-    ├── RuleEngineAdapter        — class-based (RuleEngine.match())
-    ├── LLMAnalyzerAdapter       — LLM structured output (ExecutionPlan, etc.)
-    └── CustomAdapter            — user-provided adapter.py with match()
+    Claude (intelligence)           runner.py (execution)
+    ┌─────────────────────┐        ┌──────────────────────┐
+    │ Read code           │───────▶│ config.json          │
+    │ Understand arch     │        │ test scenarios       │
+    │ Generate config     │        │ mock strategies      │
+    │ Analyze failures    │◀───────│ test reports         │
+    └─────────────────────┘        └──────────────────────┘
+
+Layered testing:
+    Layer 1 (routing)    → run_layer1    (LLM routing with mock)
+    Layer 2 (FSM)        → run_multi     (state machine transitions)
+    Layer 3 (functions)  → run           (single-function accuracy)
+    Unified report       → report_unified (combine all layers)
 
 Commands:
-    generate          Generate single-turn test cases
-    run               Run single-turn test suite
-    quick             Quick single-input test
-    report            Display readable report
-    template          Generate adapter template
-    generate_multi    Generate multi-turn FSM scenarios
-    run_multi         Run multi-turn FSM tests
-    report_multi      Display multi-turn FSM report
-    check_deps        Check project dependencies
-    fsm_coverage      Analyze FSM state transition coverage
+    generate / run / quick / report       Single-turn testing
+    generate_multi / run_multi / report_multi   Multi-turn FSM testing
+    run_layer1                            LLM routing layer testing
+    report_unified                        Combined layered report
+    check_deps / fsm_coverage             Diagnostics
 
-Exit codes:
-    0  All tests passed
-    1  Some failures, pass_rate >= 0.5
-    2  Heavy failures, pass_rate < 0.5
-    3  Runtime error (import failure, etc.)
+Exit codes: 0=pass | 1=partial(≥50%) | 2=fail(<50%) | 3=error
 """
 
 import sys
@@ -166,28 +168,26 @@ class DialogFunctionsAdapter(BaseAdapter):
         return dialog
 
     def _discover_functions(self) -> Dict[str, Callable]:
-        """Auto-discover intent detection functions using introspection.
+        """Auto-discover intent detection functions using deep introspection.
 
-        Instead of matching by name, we filter by signature:
-        - Must be callable
-        - Must accept exactly 1 positional parameter (the input text)
-        - The parameter should be str-typed or untyped
-        - Skip async functions (those are multi-turn handlers)
-        - Skip private helpers that take complex types (dict, list, etc.)
+        Classification strategy — a function is an "intent detector" if:
+        1. Takes exactly 1 positional str parameter (the input text)
+        2. Returns bool, str, dict, or enum (not None, not complex objects)
+        3. Is NOT a builder/formatter/renderer (returns text/html/etc.)
+
+        A function is classified as "helper" (excluded) if:
+        - Takes >1 required positional args (it's a utility, not a detector)
+        - Returns a formatted string (it's a text builder)
+        - Takes non-str first param (it's a data processor)
+        - Is a class constructor or decorator
         """
         funcs = {}
         for name in dir(self.dialog):
             if name.startswith("__"):
                 continue
             obj = getattr(self.dialog, name)
-            if not callable(obj):
+            if not callable(obj) or inspect.isclass(obj):
                 continue
-
-            # Skip classes
-            if inspect.isclass(obj):
-                continue
-
-            # Skip async functions (multi-turn handlers, not single-turn detectors)
             if asyncio.iscoroutinefunction(obj):
                 continue
 
@@ -198,24 +198,35 @@ class DialogFunctionsAdapter(BaseAdapter):
 
             params = list(sig.parameters.values())
 
-            # Must accept exactly 1 positional arg (the input text)
+            # Rule 1: exactly 1 required positional arg
             positional = [p for p in params
                           if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
                           and p.default is inspect.Parameter.empty]
             if len(positional) != 1:
                 continue
 
-            # Check parameter type annotation — accept str or untyped
+            # Rule 2: first param must be str or untyped
             param = positional[0]
             if param.annotation is not inspect.Parameter.empty:
                 ann = param.annotation
                 if isinstance(ann, type) and ann is not str:
-                    continue  # skip dict, list, BaseModel, etc.
+                    continue
                 if hasattr(ann, "__origin__") and ann.__origin__ is not str:
-                    continue  # skip Optional[dict], List[str], etc.
+                    continue
 
-            # Name heuristic: prefer functions with intent-related names,
-            # but don't EXCLUDE by name — signature is the source of truth
+            # Rule 3: check return type annotation — exclude text builders
+            ret = sig.return_annotation
+            if ret is not inspect.Signature.empty:
+                if isinstance(ret, type) and ret in (type(None), list, set):
+                    continue  # returns None, list, or set — likely a helper
+
+            # Rule 4: name-based soft filter (not exclusion, just classification)
+            name_lower = name.lower()
+            builder_keywords = ["build", "format", "render", "generate_text",
+                                "to_string", "serialize", "dump", "log"]
+            if any(kw in name_lower for kw in builder_keywords):
+                continue  # likely a text builder, not a detector
+
             funcs[name] = obj
 
         if not funcs:
@@ -829,6 +840,264 @@ FUNCTIONS = ["match"]  # Optional: list of testable functions
 
 
 # ===================================================================
+# Config-driven architecture (Claude generates this)
+# ===================================================================
+
+def _load_config(config_path: str = None) -> Dict:
+    """Load architecture config generated by Claude.
+
+    Config format:
+    {
+      "architecture": "hybrid",
+      "layers": {
+        "routing": {
+          "entry": "app.core.agent_builder.analyzer_node",
+          "llm_mocks": {
+            "_is_plan_related_llm": "keyword_fallback",
+            "_should_exit_llm": "keyword_fallback"
+          },
+          "params": {"task_id": "test"}
+        },
+        "dialog": {
+          "entry": "app.core.task_plan.dialog.handle_plan_chat",
+          "params": {"task_id": "test", "existing_plan": null}
+        },
+        "keywords": {
+          "source": "app.core.task_plan.prompts"
+        }
+      },
+      "states": ["idle", "collecting", "await_offer", ...]
+    }
+    """
+    if config_path is None:
+        # Auto-detect config file
+        for candidate in [
+            Path(".claude/skills/intent-test/config.json"),
+            Path("tests/generated/config.json"),
+            Path("intent_test_config.json"),
+        ]:
+            if candidate.exists():
+                config_path = str(candidate)
+                break
+
+    if config_path is None:
+        return {}
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _apply_llm_mocks(config: Dict):
+    """Apply LLM mock strategies from config.
+
+    For each function listed in llm_mocks, monkey-patch it to use
+    a keyword-based fallback instead of calling the LLM.
+    """
+    for layer_name, layer in config.get("layers", {}).items():
+        mocks = layer.get("llm_mocks", {})
+        if not mocks:
+            continue
+
+        # Find the module containing these functions
+        for func_name, strategy in mocks.items():
+            # Search loaded modules for this function
+            for mod_name, mod in list(sys.modules.items()):
+                if hasattr(mod, func_name):
+                    original = getattr(mod, func_name)
+                    if strategy == "keyword_fallback":
+                        # Replace with a sync keyword-based version
+                        def make_fallback(fn_name, orig):
+                            def fallback(*args, **kwargs):
+                                # If original is async, return a coroutine
+                                if asyncio.iscoroutinefunction(orig):
+                                    async def _async_fallback():
+                                        return _keyword_fallback_for(fn_name, args, kwargs)
+                                    return _async_fallback()
+                                return _keyword_fallback_for(fn_name, args, kwargs)
+                            return fallback
+                        setattr(mod, func_name, make_fallback(func_name, original))
+                    elif strategy == "return_true":
+                        if asyncio.iscoroutinefunction(original):
+                            async def _true():
+                                return True
+                            setattr(mod, func_name, _true)
+                        else:
+                            setattr(mod, func_name, lambda *a, **kw: True)
+                    elif strategy == "return_false":
+                        if asyncio.iscoroutinefunction(original):
+                            async def _false():
+                                return False
+                            setattr(mod, func_name, _false)
+                        else:
+                            setattr(mod, func_name, lambda *a, **kw: False)
+                    elif strategy.startswith("return:"):
+                        val = json.loads(strategy.split(":", 1)[1])
+                        if asyncio.iscoroutinefunction(original):
+                            async def _val():
+                                return val
+                            setattr(mod, func_name, _val)
+                        else:
+                            setattr(mod, func_name, lambda *a, **kw: val)
+
+
+def _keyword_fallback_for(func_name: str, args, kwargs) -> Any:
+    """Generic keyword-based fallback for mocked LLM functions.
+
+    Maps common LLM function patterns to keyword checks.
+    """
+    # Extract input text from args
+    input_text = ""
+    for arg in args:
+        if isinstance(arg, str):
+            input_text = arg
+            break
+        elif isinstance(arg, dict):
+            input_text = arg.get("content", arg.get("text", arg.get("input", "")))
+            break
+
+    name_lower = func_name.lower()
+
+    # Pattern-based fallback
+    if "plan_related" in name_lower or "plan_intent" in name_lower:
+        plan_kw = ["计划", "学习", "plan", "learn", "安排", "制定"]
+        return any(kw in input_text for kw in plan_kw)
+    elif "exit" in name_lower or "quit" in name_lower or "stop" in name_lower:
+        exit_kw = ["退出", "取消", "exit", "quit", "stop", "不要", "算了"]
+        return any(kw in input_text for kw in exit_kw)
+    elif "yes" in name_lower or "confirm" in name_lower or "accept" in name_lower:
+        yes_kw = ["好的", "是的", "确认", "yes", "ok", "对"]
+        return any(kw in input_text for kw in yes_kw)
+    elif "should_generate" in name_lower or "enough_info" in name_lower:
+        return len(input_text) > 5  # assume enough info if input is long enough
+    else:
+        return False  # safe default for unknown functions
+
+
+# ===================================================================
+# Layer 1 testing (LLM routing layer)
+# ===================================================================
+
+def cmd_run_layer1(args):
+    """Test the LLM routing layer with mock strategies.
+
+    This tests Layer 1 (analyzer/routing) by:
+    1. Loading config to find the routing entry point
+    2. Applying LLM mocks per config
+    3. Running test inputs through the routing function
+    4. Checking which intents/flags the router outputs
+    """
+    config = _load_config(args.config)
+    if not config:
+        _exit_error("No config found. Run /intent-test first so Claude generates config.json")
+
+    _apply_llm_mocks(config)
+
+    # Find routing layer
+    routing = config.get("layers", {}).get("routing", {})
+    entry_path = routing.get("entry", "")
+    params = routing.get("params", {})
+
+    if not entry_path:
+        _exit_error("No routing entry defined in config")
+
+    # Import the routing function
+    module_path, func_name = entry_path.rsplit(".", 1)
+    try:
+        mod = importlib.import_module(module_path)
+        route_fn = getattr(mod, func_name)
+    except (ImportError, AttributeError) as e:
+        _exit_error(f"Cannot import routing: {e}")
+
+    # Load test suite
+    suite_path = Path(args.suite)
+    if not suite_path.exists():
+        _exit_error(f"Suite not found: {suite_path}")
+
+    with open(suite_path, "r", encoding="utf-8") as f:
+        suite = json.load(f)
+
+    results = []
+    passed = failed = errors = 0
+
+    for tc in suite.get("test_cases", []):
+        try:
+            start = time.perf_counter()
+
+            # Build kwargs from config params + test input
+            call_kwargs = dict(params)
+            call_kwargs["user_message"] = tc["input"]
+            call_kwargs["message"] = tc["input"]
+
+            if asyncio.iscoroutinefunction(route_fn):
+                result = asyncio.run(route_fn(**call_kwargs))
+            else:
+                result = route_fn(**call_kwargs)
+
+            elapsed = round((time.perf_counter() - start) * 1000, 2)
+
+            # Extract routing decisions
+            if isinstance(result, dict):
+                decisions = result
+            elif hasattr(result, "__dict__"):
+                decisions = {k: v for k, v in result.__dict__.items()
+                            if not k.startswith("_")}
+            else:
+                decisions = {"result": result}
+
+            # Check expectations
+            expect = tc.get("expect_routing", {})
+            is_pass = True
+            failures = []
+            for key, expected in expect.items():
+                actual = decisions.get(key)
+                if actual != expected:
+                    is_pass = False
+                    failures.append(f"{key}: expected {expected!r}, got {actual!r}")
+
+            results.append({
+                "id": tc["id"],
+                "input": tc["input"],
+                "decisions": decisions,
+                "elapsed_ms": elapsed,
+                "passed": is_pass,
+                "failures": failures,
+            })
+
+            if is_pass:
+                passed += 1
+            else:
+                failed += 1
+
+        except Exception as e:
+            errors += 1
+            results.append({
+                "id": tc["id"], "input": tc["input"],
+                "error": str(e), "passed": False,
+            })
+
+    total = len(results)
+    pass_rate = round(passed / total, 4) if total else 0
+    report = {
+        "layer": "routing",
+        "total": total, "passed": passed, "failed": failed,
+        "errors": errors, "pass_rate": pass_rate,
+        "results": results,
+    }
+
+    if args.output:
+        out = Path(args.output)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with open(out, "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+
+    _output({"status": "ok", "layer": "routing",
+             "total": total, "passed": passed, "failed": failed,
+             "pass_rate": pass_rate,
+             "report_path": str(args.output) if args.output else None})
+    _exit_with_code(pass_rate)
+
+
+# ===================================================================
 # Commands: Multi-turn FSM
 # ===================================================================
 
@@ -963,6 +1232,73 @@ _BUILTIN_SCENARIOS = [
         "turns": [
             {"input": "不想开始", "expect": {"handled": False}},
             {"input": "不要修改", "expect": {"handled": False}},
+        ],
+    },
+    # --- State injection: start from non-idle states ---
+    {
+        "name": "inject_from_confirm_exit_yes",
+        "description": "Start from confirm_exit state → user confirms → idle",
+        "initial_state": {
+            "has_context": False,
+            "session": {"status": "confirm_exit", "mode": "", "turns": 0, "messages": []},
+        },
+        "turns": [
+            {"input": "是的退出", "expect": {"status": "idle", "handled": True}},
+        ],
+    },
+    {
+        "name": "inject_from_confirm_exit_no",
+        "description": "Start from confirm_exit state → user cancels → active",
+        "initial_state": {
+            "has_context": False,
+            "session": {"status": "confirm_exit", "mode": "", "turns": 0, "messages": []},
+        },
+        "turns": [
+            {"input": "不继续", "expect": {"status": "active", "handled": True}},
+        ],
+    },
+    {
+        "name": "inject_from_await_offer_accept",
+        "description": "Start from await_offer state → user accepts → active",
+        "initial_state": {
+            "has_context": False,
+            "session": {"status": "await_offer", "mode": "", "turns": 0, "messages": []},
+        },
+        "turns": [
+            {"input": "好的开始", "expect": {"status": "active", "handled": True}},
+        ],
+    },
+    {
+        "name": "inject_from_await_offer_reject",
+        "description": "Start from await_offer state → user rejects → idle",
+        "initial_state": {
+            "has_context": False,
+            "session": {"status": "await_offer", "mode": "", "turns": 0, "messages": []},
+        },
+        "turns": [
+            {"input": "不要了", "expect": {"status": "idle", "handled": True}},
+        ],
+    },
+    {
+        "name": "inject_from_active_mid_conversation",
+        "description": "Start from active with 2 turns already → continue collecting",
+        "initial_state": {
+            "has_context": False,
+            "session": {"status": "active", "mode": "init", "turns": 2, "messages": ["我想开始", "每天一次"]},
+        },
+        "turns": [
+            {"input": "下午3点", "expect": {"status": "active", "handled": True}},
+        ],
+    },
+    {
+        "name": "inject_from_await_confirm_accept",
+        "description": "Start from await_confirm → user accepts → active",
+        "initial_state": {
+            "has_context": False,
+            "session": {"status": "await_confirm", "mode": "", "turns": 0, "messages": []},
+        },
+        "turns": [
+            {"input": "可以", "expect": {"status": "active", "handled": True}},
         ],
     },
 ]
@@ -1250,6 +1586,88 @@ def cmd_report_multi(args):
 
 
 # ===================================================================
+# Unified layered report
+# ===================================================================
+
+def cmd_report_unified(args):
+    """Display a unified report combining all test layers.
+
+    Reads multiple report files and combines them:
+    - Layer 1: routing (run_layer1 output)
+    - Layer 2: FSM state transitions (run_multi output)
+    - Layer 3: single-function accuracy (run output)
+    """
+    reports = {}
+    for report_file in args.reports:
+        path = Path(report_file)
+        if not path.exists():
+            print(f"  ⚠️  Report not found: {path}")
+            continue
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        layer = data.get("layer", data.get("type", data.get("suite_name", path.stem)))
+        reports[layer] = data
+
+    if not reports:
+        _exit_error("No valid reports found")
+
+    print(f"\n{'='*60}")
+    print(f"  Unified Intent Recognition Test Report")
+    print(f"{'='*60}")
+
+    total_all = passed_all = failed_all = 0
+
+    for layer_name, data in sorted(reports.items()):
+        total = data.get("total", data.get("total_scenarios", 0))
+        passed = data.get("passed", 0)
+        failed = data.get("failed", 0)
+        rate = data.get("pass_rate", 0)
+
+        total_all += total
+        passed_all += passed
+        failed_all += failed
+
+        badge = "✅" if rate >= 0.8 else "⚠️" if rate >= 0.5 else "❌"
+        print(f"\n  {badge} Layer: {layer_name}")
+        print(f"     Total: {total}  |  Passed: {passed}  |  Failed: {failed}  |  Rate: {rate*100:.1f}%")
+
+        # Show transitions for multi-turn
+        transitions = data.get("transitions_covered", {})
+        if transitions:
+            print(f"     Transitions covered: {len(transitions)}")
+
+        # Show top failures
+        failures = []
+        for r in data.get("results", data.get("scenarios", [])):
+            if not r.get("passed", True):
+                failures.append(r)
+        if failures:
+            print(f"     Top failures:")
+            for f in failures[:3]:
+                name = f.get("name", f.get("id", "unknown"))
+                detail = f.get("description", f.get("error", ""))
+                print(f"       ❌ {name}: {detail[:60]}")
+
+    # Overall summary
+    overall_rate = round(passed_all / total_all, 4) if total_all else 0
+    badge = "✅" if overall_rate >= 0.8 else "⚠️" if overall_rate >= 0.5 else "❌"
+
+    print(f"\n{'─'*60}")
+    print(f"  {badge} Overall: {passed_all}/{total_all} passed ({overall_rate*100:.1f}%)")
+    print(f"{'='*60}\n")
+
+    _output({
+        "overall_pass_rate": overall_rate,
+        "total": total_all,
+        "passed": passed_all,
+        "failed": failed_all,
+        "layers": {name: {"pass_rate": d.get("pass_rate", 0),
+                          "total": d.get("total", d.get("total_scenarios", 0))}
+                   for name, d in reports.items()},
+    })
+
+
+# ===================================================================
 # Commands: FSM Coverage Analysis
 # ===================================================================
 
@@ -1481,6 +1899,17 @@ def main():
     p = sub.add_parser("check_deps", help="Check project dependencies")
     p = sub.add_parser("fsm_coverage", help="Analyze FSM state transition coverage")
 
+    # Layer 1 (routing)
+    p = sub.add_parser("run_layer1", help="Test LLM routing layer with mocks")
+    p.add_argument("--suite", required=True)
+    p.add_argument("--config", help="Path to config.json")
+    p.add_argument("--output", help="Save report to file")
+
+    # Unified report
+    p = sub.add_parser("report_unified", help="Display unified layered report")
+    p.add_argument("--reports", nargs="+", required=True,
+                   help="Report files to combine")
+
     args = parser.parse_args()
 
     commands = {
@@ -1494,6 +1923,8 @@ def main():
         "report_multi": cmd_report_multi,
         "check_deps": cmd_check_deps,
         "fsm_coverage": cmd_fsm_coverage,
+        "run_layer1": cmd_run_layer1,
+        "report_unified": cmd_report_unified,
     }
     commands[args.command](args)
 

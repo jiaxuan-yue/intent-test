@@ -75,14 +75,14 @@ class BaseAdapter(ABC):
 
     @abstractmethod
     def get_handle_fn(self) -> Optional[Callable]:
-        """Return the multi-turn handler (handle_plan_chat) if available."""
+        """Return the multi-turn handler if available."""
 
     def get_type(self) -> str:
         return self.__class__.__name__.replace("Adapter", "").lower()
 
 
 # ===================================================================
-# Dialog Functions Adapter (ChatTutor-style)
+# Dialog Functions Adapter (function-based projects)
 # ===================================================================
 
 class DialogFunctionsAdapter(BaseAdapter):
@@ -97,9 +97,10 @@ class DialogFunctionsAdapter(BaseAdapter):
     def _load_dialog(self):
         candidates = [
             self.root / "src" / "intent_recognition" / "dialog.py",
+            self.root / "app" / "core" / "dialog.py",
             self.root / "src" / "dialog.py",
+            self.root / "app" / "dialog.py",
             self.root / "dialog.py",
-            self.root / "src" / "chattutor" / "dialog.py",
         ]
         dialog_path = None
         for c in candidates:
@@ -115,14 +116,38 @@ class DialogFunctionsAdapter(BaseAdapter):
             raise ImportError("dialog.py not found in project")
 
         src_dir = dialog_path.parent
+        # Compute full package path from dialog.py location
+        # e.g. app/core/task/dialog.py → pkg_prefix = "app.core.task."
+        pkg_parts = []
+        p = src_dir
+        while p.parent != p:
+            if (p / "__init__.py").exists():
+                pkg_parts.insert(0, p.name)
+                p = p.parent
+            else:
+                break
+        pkg_prefix = ".".join(pkg_parts) + "." if pkg_parts else ""
+
+        # Register parent packages (e.g. app, app.core, app.core.task)
+        for i in range(len(pkg_parts)):
+            pkg = ".".join(pkg_parts[:i + 1])
+            if pkg not in sys.modules:
+                pkg_mod = types.ModuleType(pkg)
+                pkg_mod.__path__ = [str(p)]
+                sys.modules[pkg] = pkg_mod
+
         for dep_name in ["prompts", "utils", "models", "config", "constants"]:
             dep_path = src_dir / f"{dep_name}.py"
             if dep_path.exists() and dep_name not in sys.modules:
                 sys.path.insert(0, str(src_dir))
                 try:
-                    spec = importlib.util.spec_from_file_location(dep_name, str(dep_path))
+                    # Register with both simple name and full package path
+                    full_name = pkg_prefix + dep_name if pkg_prefix else dep_name
+                    spec = importlib.util.spec_from_file_location(full_name, str(dep_path))
                     mod = importlib.util.module_from_spec(spec)
-                    sys.modules[dep_name] = mod
+                    sys.modules[dep_name] = mod          # simple: "prompts"
+                    if pkg_prefix:
+                        sys.modules[full_name] = mod     # full: "app.core.task.prompts"
                     spec.loader.exec_module(mod)
                 except Exception:
                     pass
@@ -150,7 +175,7 @@ class DialogFunctionsAdapter(BaseAdapter):
         results = {}
         for func_name, func in self.functions.items():
             try:
-                # Skip handle_plan_chat for single-turn (it's async multi-turn)
+                # Skip async handlers for single-turn (they are multi-turn handlers)
                 if "handle" in func_name.lower() and asyncio.iscoroutinefunction(func):
                     continue
                 result = func(input_text)
@@ -167,7 +192,13 @@ class DialogFunctionsAdapter(BaseAdapter):
         return list(self.functions.keys())
 
     def get_handle_fn(self) -> Optional[Callable]:
-        return getattr(self.dialog, "handle_plan_chat", None)
+        # Look for common multi-turn handler names
+        for name in ["handle_plan_chat", "handle_dialog", "handle_turn",
+                      "process_message", "handle_message"]:
+            fn = getattr(self.dialog, name, None)
+            if fn and (asyncio.iscoroutinefunction(fn) or callable(fn)):
+                return fn
+        return None
 
     def get_module(self):
         return self.dialog
@@ -247,7 +278,12 @@ class LLMAnalyzerAdapter(BaseAdapter):
         return ["match"]
 
     def get_handle_fn(self):
-        return getattr(self._mod, "handle_plan_chat", None)
+        for name in ["handle_plan_chat", "handle_dialog", "handle_turn",
+                      "process_message", "handle_message"]:
+            fn = getattr(self._mod, name, None)
+            if fn and callable(fn):
+                return fn
+        return None
 
 
 # ===================================================================
@@ -279,7 +315,12 @@ class CustomAdapter(BaseAdapter):
         return getattr(self._mod, "FUNCTIONS", ["match"])
 
     def get_handle_fn(self):
-        return getattr(self._mod, "handle_plan_chat", None)
+        for name in ["handle_plan_chat", "handle_dialog", "handle_turn",
+                      "process_message", "handle_message"]:
+            fn = getattr(self._mod, name, None)
+            if fn and callable(fn):
+                return fn
+        return None
 
 
 # ===================================================================
@@ -355,10 +396,15 @@ def _mock_all_dependencies():
                 setattr(mock, attr, mock_cls)
             sys.modules[mod_name] = mock
 
-    # Mock generator module for multi-turn testing
+    # Mock project-specific generator modules so async LLM calls trigger fallback.
+    # These are common patterns in intent recognition projects that use LLM layers.
+    # The actual module path varies per project — mock the most common patterns.
     for gen_mod in [
         "app", "app.core", "app.core.task_plan",
         "app.core.task_plan.generator",
+        "app.core.intent", "app.core.intent.generator",
+        "app.services", "app.services.llm",
+        "core", "core.generator", "core.llm",
     ]:
         if gen_mod not in sys.modules:
             sys.modules[gen_mod] = types.ModuleType(gen_mod)
@@ -700,129 +746,136 @@ FUNCTIONS = ["match"]  # Optional: list of testable functions
 # ===================================================================
 
 _BUILTIN_SCENARIOS = [
+    # --- Happy paths ---
     {
-        "name": "init_happy_path",
-        "description": "New plan: idle → collecting(init) → await_plan_confirm",
-        "initial_state": {"has_plan": False, "plan_session": None},
+        "name": "happy_path_init",
+        "description": "New session: idle → active → confirmation",
+        "initial_state": {"has_context": False, "session": None},
         "turns": [
-            {"input": "我想学Python", "expect": {"status": "collecting", "mode": "init", "handled": True}},
-            {"input": "想入门编程，每天1小时", "expect": {"status": "collecting", "handled": True}},
+            {"input": "我想开始", "expect": {"status": "active", "mode": "init", "handled": True}},
+            {"input": "每天一次", "expect": {"status": "active", "handled": True}},
         ],
     },
     {
-        "name": "update_happy_path",
-        "description": "Update plan: idle → collecting(update) → await_plan_confirm",
-        "initial_state": {"has_plan": True, "plan_session": None},
+        "name": "happy_path_update",
+        "description": "Update existing: idle → active(update) → confirmation",
+        "initial_state": {"has_context": True, "session": None},
         "turns": [
-            {"input": "我想修改学习计划", "expect": {"status": "collecting", "mode": "update", "handled": True}},
-            {"input": "改成每天2小时", "expect": {"status": "collecting", "handled": True}},
+            {"input": "我想修改", "expect": {"status": "active", "mode": "update", "handled": True}},
+            {"input": "改成两次", "expect": {"status": "active", "handled": True}},
+        ],
+    },
+    # --- Exit flows ---
+    {
+        "name": "exit_confirmed",
+        "description": "User exits during active session → confirmed → idle",
+        "initial_state": {"has_context": False, "session": None},
+        "turns": [
+            {"input": "我想开始", "expect": {"status": "active", "handled": True}},
+            {"input": "算了退出", "expect": {"status": "confirm_exit", "handled": True}},
+            {"input": "是的退出", "expect": {"status": "idle", "handled": True}},
         ],
     },
     {
-        "name": "collecting_exit_confirm_yes",
-        "description": "Exit during collecting → confirmed → idle",
-        "initial_state": {"has_plan": False, "plan_session": None},
+        "name": "exit_cancelled",
+        "description": "User exits then cancels → resume active",
+        "initial_state": {"has_context": False, "session": None},
         "turns": [
-            {"input": "我想学Python", "expect": {"status": "collecting", "handled": True}},
-            {"input": "算了不想学了", "expect": {"status": "await_exit_confirm", "handled": True}},
-            {"input": "是的，退出", "expect": {"status": "idle", "handled": True}},
+            {"input": "我想开始", "expect": {"status": "active", "handled": True}},
+            {"input": "算了退出", "expect": {"status": "confirm_exit", "handled": True}},
+            {"input": "不继续", "expect": {"status": "active", "handled": True}},
+        ],
+    },
+    # --- Offer flows ---
+    {
+        "name": "offer_accepted",
+        "description": "System offers action, user accepts → active",
+        "initial_state": {"has_context": False, "session": None},
+        "turns": [
+            {"input": "帮我安排", "expect": {"handled": True}},
         ],
     },
     {
-        "name": "collecting_exit_confirm_no",
-        "description": "Exit during collecting → cancelled → resume collecting",
-        "initial_state": {"has_plan": False, "plan_session": None},
-        "turns": [
-            {"input": "我想学Python", "expect": {"status": "collecting", "handled": True}},
-            {"input": "算了退出吧", "expect": {"status": "await_exit_confirm", "handled": True}},
-            {"input": "不，继续", "expect": {"status": "collecting", "handled": True}},
-        ],
-    },
-    {
-        "name": "await_offer_accept",
-        "description": "System offers plan, user accepts → collecting",
-        "initial_state": {"has_plan": False, "plan_session": None},
-        "turns": [
-            {"input": "帮我制定个计划", "expect": {"handled": True}},
-        ],
-    },
-    {
-        "name": "await_offer_reject",
+        "name": "offer_rejected",
         "description": "Off-topic input → not handled",
-        "initial_state": {"has_plan": False, "plan_session": None},
+        "initial_state": {"has_context": False, "session": None},
         "turns": [
-            {"input": "今天天气怎么样", "expect": {"handled": False}},
+            {"input": "今天天气怎样", "expect": {"handled": False}},
+        ],
+    },
+    # --- Confirmation flows ---
+    {
+        "name": "confirm_accepted",
+        "description": "Proposal accepted → active",
+        "initial_state": {"has_context": False, "session": None},
+        "turns": [
+            {"input": "我想开始", "expect": {"status": "active", "handled": True}},
         ],
     },
     {
-        "name": "await_confirm_accept",
-        "description": "Plan proposal accepted",
-        "initial_state": {"has_plan": False, "plan_session": None},
+        "name": "confirm_rejected",
+        "description": "User declines → idle",
+        "initial_state": {"has_context": False, "session": None},
         "turns": [
-            {"input": "我想学Python", "expect": {"status": "collecting", "handled": True}},
+            {"input": "算了不要了", "expect": {"handled": True}},
+        ],
+    },
+    # --- Update after confirm ---
+    {
+        "name": "post_confirm_update",
+        "description": "After confirmation, user wants to update → active(update)",
+        "initial_state": {"has_context": True, "session": None},
+        "turns": [
+            {"input": "修改我的设置", "expect": {"status": "active", "mode": "update", "handled": True}},
+        ],
+    },
+    # --- Guard rails ---
+    {
+        "name": "detail_during_active_no_exit",
+        "description": "User provides details during active — should NOT trigger exit",
+        "initial_state": {"has_context": False, "session": None},
+        "turns": [
+            {"input": "我想开始", "expect": {"status": "active", "handled": True}},
+            {"input": "每天下午3点一次", "expect": {"status": "active", "handled": True}},
+        ],
+    },
+    # --- Fallback ---
+    {
+        "name": "update_without_context",
+        "description": "Update keyword but no existing context → falls back to init",
+        "initial_state": {"has_context": False, "session": None},
+        "turns": [
+            {"input": "修改设置", "expect": {"status": "active", "handled": True}},
         ],
     },
     {
-        "name": "await_confirm_reject",
-        "description": "User decides not to proceed",
-        "initial_state": {"has_plan": False, "plan_session": None},
+        "name": "max_turns_auto_complete",
+        "description": "Active session reaches max turns → auto-generates result",
+        "initial_state": {"has_context": False, "session": None},
         "turns": [
-            {"input": "算了不学了", "expect": {"handled": True}},
+            {"input": "我想开始", "expect": {"status": "active", "handled": True}},
+            {"input": "每天", "expect": {"status": "active", "handled": True}},
+            {"input": "一次", "expect": {"handled": True}},
+        ],
+    },
+    # --- Regression patterns (universal, not project-specific) ---
+    {
+        "name": "regression_broad_keyword_false_positive",
+        "description": "Regression: overly broad keywords match unrelated inputs",
+        "initial_state": {"has_context": False, "session": None},
+        "turns": [
+            {"input": "随便聊聊", "expect": {"handled": False}},
+            {"input": "讲个笑话", "expect": {"handled": False}},
+            {"input": "你是谁", "expect": {"handled": False}},
         ],
     },
     {
-        "name": "plan_confirm_then_update",
-        "description": "After plan confirmed, user wants update → collecting(update)",
-        "initial_state": {"has_plan": True, "plan_session": None},
+        "name": "regression_negation_not_checked",
+        "description": "Regression: negation prefix not handled before keyword match",
+        "initial_state": {"has_context": False, "session": None},
         "turns": [
-            {"input": "修改我的学习计划", "expect": {"status": "collecting", "mode": "update", "handled": True}},
-        ],
-    },
-    {
-        "name": "exit_with_update_details_guard",
-        "description": "User provides details during collecting — should NOT trigger exit",
-        "initial_state": {"has_plan": False, "plan_session": None},
-        "turns": [
-            {"input": "我想学Python", "expect": {"status": "collecting", "handled": True}},
-            {"input": "每天下午2点学1小时", "expect": {"status": "collecting", "handled": True}},
-        ],
-    },
-    {
-        "name": "update_keyword_no_plan",
-        "description": "Update keyword but no plan exists → falls back to init mode",
-        "initial_state": {"has_plan": False, "plan_session": None},
-        "turns": [
-            {"input": "修改学习计划", "expect": {"status": "collecting", "handled": True}},
-        ],
-    },
-    {
-        "name": "collecting_max_turns",
-        "description": "Collecting reaches max turns → auto-generates plan",
-        "initial_state": {"has_plan": False, "plan_session": None},
-        "turns": [
-            {"input": "我想学Python", "expect": {"status": "collecting", "handled": True}},
-            {"input": "每天学", "expect": {"status": "collecting", "handled": True}},
-            {"input": "1小时", "expect": {"handled": True}},
-        ],
-    },
-    # Regression cases from ChatTutor bugs
-    {
-        "name": "regression_time_keywords_false_positive",
-        "description": "P0 Bug: TIME_KEYWORDS single chars cause false positives",
-        "initial_state": {"has_plan": False, "plan_session": None},
-        "turns": [
-            {"input": "今天天气不错", "expect": {"handled": False}},
-            {"input": "周末去看电影", "expect": {"handled": False}},
-            {"input": "这个月很忙", "expect": {"handled": False}},
-        ],
-    },
-    {
-        "name": "regression_negation_not_handled",
-        "description": "P1 Bug: negation prefix '不' not checked before keyword match",
-        "initial_state": {"has_plan": False, "plan_session": None},
-        "turns": [
-            {"input": "不想学Python", "expect": {"handled": False}},
-            {"input": "不计划了", "expect": {"handled": False}},
+            {"input": "不想开始", "expect": {"handled": False}},
+            {"input": "不要修改", "expect": {"handled": False}},
         ],
     },
 ]
@@ -847,13 +900,18 @@ def cmd_run_multi(args):
         _exit_error(str(e))
 
     if not isinstance(adapter, DialogFunctionsAdapter):
-        _exit_error("Multi-turn testing requires --adapter dialog (needs handle_plan_chat)")
+        _exit_error("Multi-turn testing requires --adapter dialog")
 
     handle_fn = adapter.get_handle_fn()
     if handle_fn is None:
-        _exit_error("handle_plan_chat not found in dialog module")
+        _exit_error("No multi-turn handler found in dialog module (looked for handle_plan_chat, handle_dialog, handle_turn, process_message)")
 
-    normalize_fn = getattr(adapter.get_module(), "_normalize_plan_session", None)
+    normalize_fn = None
+    for name in ["_normalize_plan_session", "_normalize_session", "normalize_session"]:
+        fn = getattr(adapter.get_module(), name, None)
+        if fn:
+            normalize_fn = fn
+            break
 
     suite_path = Path(args.suite)
     if not suite_path.exists():
@@ -901,22 +959,23 @@ def cmd_run_multi(args):
 
 def _run_scenario(scenario, handle_fn, normalize_fn, transitions):
     """Run a single multi-turn scenario."""
-    current_session = scenario.get("initial_state", {}).get("plan_session")
-    has_plan = scenario.get("initial_state", {}).get("has_plan", False)
+    initial = scenario.get("initial_state", {})
+    current_session = initial.get("session") or initial.get("plan_session")
+    has_context = initial.get("has_context", initial.get("has_plan", False))
     turn_results = []
     scenario_passed = True
     prev_status = "idle"
 
     for i, turn in enumerate(scenario.get("turns", [])):
         try:
-            result = _call_handle_plan_chat(
+            result = _call_handle_fn(
                 handle_fn, normalize_fn,
                 user_message=turn["input"],
-                plan_session=current_session,
-                has_plan=has_plan,
+                session=current_session,
+                has_context=has_context,
             )
 
-            current_session = result.get("plan_session", current_session)
+            current_session = result.get("session") or result.get("plan_session", current_session)
             if current_session and isinstance(current_session, dict):
                 current_status = current_session.get("status", "unknown")
             else:
@@ -972,11 +1031,11 @@ def _run_scenario(scenario, handle_fn, normalize_fn, transitions):
     }
 
 
-def _call_handle_plan_chat(handle_fn, normalize_fn, user_message, plan_session, has_plan):
-    """Call handle_plan_chat handling async/sync and various signatures."""
-    if normalize_fn and plan_session is None:
+def _call_handle_fn(handle_fn, normalize_fn, user_message, session, has_context):
+    """Call a multi-turn handler, handling async/sync and various signatures."""
+    if normalize_fn and session is None:
         try:
-            plan_session = normalize_fn(None)
+            session = normalize_fn(None)
         except Exception:
             pass
 
@@ -984,10 +1043,12 @@ def _call_handle_plan_chat(handle_fn, normalize_fn, user_message, plan_session, 
     is_async = asyncio.iscoroutinefunction(handle_fn) or inspect.iscoroutinefunction(handle_fn)
 
     call_variants = [
-        {"user_message": user_message, "plan_session": plan_session, "has_plan": has_plan},
-        {"user_message": user_message, "plan_session": plan_session},
-        {"input_text": user_message, "plan_session": plan_session, "has_plan": has_plan},
-        {"message": user_message, "session": plan_session},
+        {"user_message": user_message, "plan_session": session, "has_plan": has_context},
+        {"user_message": user_message, "session": session, "has_context": has_context},
+        {"user_message": user_message, "plan_session": session},
+        {"user_message": user_message, "session": session},
+        {"input_text": user_message, "plan_session": session, "has_plan": has_context},
+        {"message": user_message, "session": session},
     ]
 
     result = None
@@ -1017,10 +1078,16 @@ def _call_handle_plan_chat(handle_fn, normalize_fn, user_message, plan_session, 
 
     elapsed = round((time.perf_counter() - start) * 1000, 2)
     if result is None:
-        raise RuntimeError(f"Could not call handle_plan_chat: {last_error}")
+        raise RuntimeError(f"Could not call multi-turn handler: {last_error}")
 
     result["elapsed_ms"] = elapsed
-    if "plan_session" not in result and "status" in result:
+    # Normalize session key
+    if "session" not in result and "plan_session" in result:
+        result["session"] = result["plan_session"]
+    elif "plan_session" not in result and "session" in result:
+        result["plan_session"] = result["session"]
+    elif "session" not in result and "plan_session" not in result and "status" in result:
+        result["session"] = result
         result["plan_session"] = result
     return result
 
@@ -1205,7 +1272,8 @@ def cmd_check_deps(args):
 def _resolve_project_root() -> Path:
     current = Path(__file__).resolve().parent
     for _ in range(10):
-        if (current / "src").is_dir() or (current / "pyproject.toml").exists():
+        if ((current / "src").is_dir() or (current / "pyproject.toml").exists()
+                or (current / "app").is_dir()):
             return current
         current = current.parent
     return Path.cwd()

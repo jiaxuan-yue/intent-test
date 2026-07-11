@@ -23,6 +23,7 @@ SKILL_SRC="$SCRIPT_DIR/.claude/skills"
 # Defaults
 INSTALL_MODE="project"
 TARGET_DIR="."
+FORCE=false
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -36,15 +37,21 @@ while [[ $# -gt 0 ]]; do
             TARGET_DIR="$2"
             shift 2
             ;;
+        --force|-f)
+            FORCE=true
+            shift
+            ;;
         --help|-h)
             echo "Usage:"
             echo "  bash install.sh                        Install to current directory"
             echo "  bash install.sh --global               Install to ~/.claude (all projects)"
             echo "  bash install.sh --path /path/to/dir    Install to specific directory"
+            echo "  bash install.sh --force                Overwrite without confirmation"
             echo ""
             echo "Options:"
             echo "  --global     User-level install (skill available in all projects)"
             echo "  --path DIR   Install to a specific project directory"
+            echo "  -f, --force  Overwrite existing installation without confirmation"
             echo "  -h, --help   Show this help"
             exit 0
             ;;
@@ -84,11 +91,21 @@ echo ""
 
 # Check if already installed
 if [[ -f "$SKILL_DEST/intent-test.md" ]]; then
-    echo -e "${YELLOW}⚠  Skill already installed at $SKILL_DEST/intent-test.md${NC}"
-    read -rp "   Overwrite? [y/N] " confirm
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-        echo "   Skipped."
-        exit 0
+    if [[ "$FORCE" == true ]]; then
+        echo -e "  ${YELLOW}⚠  Overwriting existing installation (--force)${NC}"
+    else
+        echo -e "${YELLOW}⚠  Skill already installed at $SKILL_DEST/intent-test.md${NC}"
+        # Read from terminal directly to avoid pipe stdin issues
+        if [[ -t 0 ]]; then
+            read -rp "   Overwrite? [y/N] " confirm
+            if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+                echo "   Skipped."
+                exit 0
+            fi
+        else
+            echo "   Use --force to overwrite, or run interactively."
+            exit 0
+        fi
     fi
     echo ""
 fi

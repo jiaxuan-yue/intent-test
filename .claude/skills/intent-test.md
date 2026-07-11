@@ -29,17 +29,17 @@ find . -type d | grep -iE "intent|engine|nlp|recogni|dialog|agent"
 **Step 2 — Keyword scan.** Grep for intent-related code patterns:
 
 ```bash
-grep -rl "intent\|keyword_rule\|match.*intent\|recognize\|classify\|detect_intent\|ExecutionPlan\|plan_intent" --include="*.py" .
+grep -rl "intent\|keyword_rule\|match.*intent\|recognize\|classify\|detect_intent\|plan_intent" --include="*.py" .
 ```
 
 **Step 3 — Read and classify architecture.** Read discovered files and determine which architecture type(s) the project uses:
 
 | Architecture | Signs | runner.py adapter | Adapter class |
 |-------------|-------|-------------------|---------------|
-| **Function-based dialog** | `dialog.py`, `_detect_*_intent()`, `_is_yes()`, `handle_plan_chat()` | `--adapter dialog` | `DialogFunctionsAdapter` |
+| **Function-based dialog** | `dialog.py`, `_detect_*_intent()`, `_is_yes()`, async handler functions | `--adapter dialog` | `DialogFunctionsAdapter` |
 | **Class-based engine** | `class RuleEngine`, `engine.match(input)` | `--adapter rule_engine` | `RuleEngineAdapter` |
-| **LLM structured output** | `ExecutionPlan`, prompt chains, `BaseModel` | `--adapter llm_analyzer` | `LLMAnalyzerAdapter` |
-| **Two-layer hybrid** | LLM `analyzer_node` + keyword `dialog.py` | `--adapter dialog` (Layer 2) | `DialogFunctionsAdapter` |
+| **LLM structured output** | Pydantic `BaseModel` output, prompt chains | `--adapter llm_analyzer` | `LLMAnalyzerAdapter` |
+| **Two-layer hybrid** | LLM analyzer layer + keyword dialog layer | `--adapter dialog` (Layer 2) | `DialogFunctionsAdapter` |
 | **Custom** | Any other architecture | `--adapter custom` | `CustomAdapter` |
 | **Auto-detect** | Unknown | `--adapter auto` (default) | tries dialog → rule_engine |
 
@@ -57,15 +57,15 @@ All adapters implement `BaseAdapter` interface:
 - Fallback behavior (None? LLM call? clarification?)
 - Context/state dependencies (does recognition depend on dialog state?)
 
-For **two-layer architectures** (e.g., ChatTutor):
-- **Layer 1 (LLM Analyzer)**: `analyzer_node` → outputs `ExecutionPlan` with boolean fields. Cannot be unit-tested without LLM API access — note this as a limitation.
-- **Layer 2 (Keyword Dialog)**: `dialog.py` → `_detect_plan_intent()`, `_is_learn_intent()`, `_is_yes()`, `_is_no()`, `_is_exit_intent()`, etc. Fully testable with runner.py.
+For **two-layer architectures** (LLM Analyzer + Keyword Dialog):
+- **Layer 1 (LLM Analyzer)**: Outputs structured data with intent fields. Cannot be unit-tested without LLM API access — note this as a limitation.
+- **Layer 2 (Keyword Dialog)**: `dialog.py` with `_detect_*_intent()`, `_is_yes()`, `_is_no()`, `_is_exit_intent()`, etc. Fully testable with runner.py.
 - **Testing strategy**: Use `--adapter dialog` to test Layer 2 exhaustively. For Layer 1, generate test inputs and document expected LLM outputs for manual/CI review.
 
 **Step 5 — Choose adapter and generate if needed.**
 
 runner.py supports five adapter types via class-based `BaseAdapter` architecture:
-- `--adapter dialog` — `DialogFunctionsAdapter`: auto-loads `dialog.py`, mocks heavy deps, tests all `_detect_*` functions + multi-turn `handle_plan_chat()`
+- `--adapter dialog` — `DialogFunctionsAdapter`: auto-loads `dialog.py`, mocks heavy deps, tests all detection functions + multi-turn async handlers
 - `--adapter rule_engine` — `RuleEngineAdapter`: imports `RuleEngine` class
 - `--adapter llm_analyzer` — `LLMAnalyzerAdapter`: loads LLM structured output via adapter-path
 - `--adapter custom --adapter-path adapter.py` — `CustomAdapter`: user-provided `match()` function
@@ -105,7 +105,7 @@ Write test suite to `{output_dir}/{suite_name}.json`.
 Run the test suite through the adapter. Choose the correct adapter flag based on Phase 1 discovery:
 
 ```bash
-# Dialog/function-based projects (ChatTutor, etc.)
+# Dialog/function-based projects
 python .claude/skills/intent-test/runner.py run \
   --suite tests/generated/intent_tests.json \
   --adapter dialog \
@@ -136,7 +136,7 @@ python .claude/skills/intent-test/runner.py report --results tests/generated/int
 
 #### Multi-Turn State Machine Testing
 
-For projects with dialog state machines (e.g., `handle_plan_chat()` with FSM states), use the dedicated multi-turn commands:
+For projects with dialog state machines (FSM with multiple states and transitions), use the dedicated multi-turn commands:
 
 ```bash
 # Generate 12 built-in FSM scenarios (covers all state transitions)
@@ -155,9 +155,9 @@ python .claude/skills/intent-test/runner.py report_multi \
 
 **How it works:**
 - 12 built-in scenarios cover all 6 FSM states and major transition paths
-- Each scenario chains multiple turns, passing `plan_session` between calls
-- LLM dependencies are mocked: `_get_chat_model()` raises → fallback to `_next_default_question()`
-- `asyncio.run()` wraps async `handle_plan_chat()` calls
+- Each scenario chains multiple turns, passing session state between calls
+- LLM dependencies are mocked: async LLM calls raise → fallback to default questions
+- `asyncio.run()` wraps async handler calls
 - Validates status, mode, handled flag, and turn count after each turn
 
 ### Phase 4: Analyze Results

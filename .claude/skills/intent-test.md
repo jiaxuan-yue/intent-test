@@ -34,13 +34,20 @@ grep -rl "intent\|keyword_rule\|match.*intent\|recognize\|classify\|detect_inten
 
 **Step 3 — Read and classify architecture.** Read discovered files and determine which architecture type(s) the project uses:
 
-| Architecture | Signs | runner.py adapter | How to call |
-|-------------|-------|-------------------|-------------|
-| **Class-based engine** | `class RuleEngine`, `engine.match(input)` | `--adapter rule_engine` | Instantiate class, call `.match()` |
-| **Function-based dialog** | `dialog.py`, `_detect_*_intent()`, `_is_yes()`, `_is_no()` | `--adapter dialog` | Call each detection function individually |
-| **Two-layer hybrid** | LLM `analyzer_node` + keyword `dialog.py` | `--adapter dialog` (Layer 2) | Test keyword layer directly; LLM layer needs manual review |
-| **LLM-only analyzer** | `ExecutionPlan`, prompt chains, no keyword rules | `--adapter custom` | Generate adapter that calls LLM analyzer |
-| **Config-driven** | JSON/YAML keyword→intent mapping | `--adapter custom` | Load config, implement matching in adapter |
+| Architecture | Signs | runner.py adapter | Adapter class |
+|-------------|-------|-------------------|---------------|
+| **Function-based dialog** | `dialog.py`, `_detect_*_intent()`, `_is_yes()`, `handle_plan_chat()` | `--adapter dialog` | `DialogFunctionsAdapter` |
+| **Class-based engine** | `class RuleEngine`, `engine.match(input)` | `--adapter rule_engine` | `RuleEngineAdapter` |
+| **LLM structured output** | `ExecutionPlan`, prompt chains, `BaseModel` | `--adapter llm_analyzer` | `LLMAnalyzerAdapter` |
+| **Two-layer hybrid** | LLM `analyzer_node` + keyword `dialog.py` | `--adapter dialog` (Layer 2) | `DialogFunctionsAdapter` |
+| **Custom** | Any other architecture | `--adapter custom` | `CustomAdapter` |
+| **Auto-detect** | Unknown | `--adapter auto` (default) | tries dialog → rule_engine |
+
+All adapters implement `BaseAdapter` interface:
+- `detect_intents(input, context)` — unified detection result
+- `get_keyword_sets()` — keywords for auto test generation
+- `get_all_functions()` — list of testable functions
+- `get_handle_fn()` — multi-turn handler if available
 
 **Step 4 — Build intent model.** Extract:
 - All intent names/enums (from code or config)
@@ -57,17 +64,14 @@ For **two-layer architectures** (e.g., ChatTutor):
 
 **Step 5 — Choose adapter and generate if needed.**
 
-runner.py supports three built-in adapter types:
-- `--adapter dialog` — auto-loads `dialog.py`, mocks heavy deps (langchain_core, langgraph), tests all `_detect_*` functions
-- `--adapter rule_engine` — imports `RuleEngine` class from `intent_recognition.engine`
-- `--adapter custom --adapter-path adapter.py` — loads user-provided adapter
-- `--adapter auto` (default) — tries dialog first, then rule_engine
+runner.py supports five adapter types via class-based `BaseAdapter` architecture:
+- `--adapter dialog` — `DialogFunctionsAdapter`: auto-loads `dialog.py`, mocks heavy deps, tests all `_detect_*` functions + multi-turn `handle_plan_chat()`
+- `--adapter rule_engine` — `RuleEngineAdapter`: imports `RuleEngine` class
+- `--adapter llm_analyzer` — `LLMAnalyzerAdapter`: loads LLM structured output via adapter-path
+- `--adapter custom --adapter-path adapter.py` — `CustomAdapter`: user-provided `match()` function
+- `--adapter auto` (default) — tries `DialogFunctionsAdapter` → `RuleEngineAdapter`
 
-For architectures not covered by built-in adapters, generate `tests/generated/adapter.py`:
-```python
-def match(input_text: str) -> dict:
-    """Returns: {"intent": str|None, "confidence": float, "details": {...}}"""
-```
+For new architectures, write a ~50 line adapter implementing `BaseAdapter`.
 
 **Step 6 — Fallback if nothing found.** If Steps 1-4 find zero intent code:
 - Ask user to point to the module or provide intents as JSON
@@ -223,7 +227,7 @@ Parse from user's skill invocation (e.g., `/intent-test mode=analyze auto_fix=tr
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `mode` | `analyze` | `generate` / `run` / `analyze` / `quick` / `fix` / `research` / `generate_multi` / `run_multi` / `analyze_multi` |
+| `mode` | `analyze` | `generate` / `run` / `analyze` / `quick` / `fix` / `research` / `generate_multi` / `run_multi` / `analyze_multi` / `check_deps` / `fsm_coverage` |
 | `intents` | auto-detect | JSON string of custom intents (fallback if no code found) |
 | `name` | `intent_tests` | Suite name |
 | `output_dir` | `tests/generated` | Output directory |
@@ -231,16 +235,49 @@ Parse from user's skill invocation (e.g., `/intent-test mode=analyze auto_fix=tr
 | `dry_run` | `true` | Preview fixes without applying |
 | `max_fixes` | `5` | Maximum fixes to apply |
 | `input` | — | Single input for `quick` mode |
+| `context` | — | State context JSON for `quick` mode (e.g. `'{"status": "collecting"}'`) |
 | `regression_file` | — | Path to regression test cases |
 | `performance_threshold` | — | Max response time in ms |
 
 ## Quick Mode
 
 For `mode=quick`:
-1. Use existing adapter or generate one
-2. Call adapter's `match(input)` on the provided input
+1. Use existing adapter or auto-detect
+2. Call `adapter.detect_intents(input, context)` on the provided input
 3. Show: detected intent, confidence, matched keywords/patterns
 4. If confidence < 0.5, suggest LLM fallback or rule improvement
+
+**Context-aware testing** — test detection in a specific dialog state:
+```bash
+python .claude/skills/intent-test/runner.py quick \
+  --input "继续" --context '{"status": "await_exit_confirm"}' --adapter dialog
+```
+
+## Utility Commands
+
+### check_deps — Dependency diagnostics
+
+Check which project dependencies are available, mocked, or missing:
+```bash
+python .claude/skills/intent-test/runner.py check_deps
+```
+Mocked: langchain_core, langgraph, langchain_openai, langchain_deepseek, openai, anthropic, pydantic.
+
+### fsm_coverage — FSM state transition analysis
+
+Analyze the project's state machine and show coverage:
+```bash
+python .claude/skills/intent-test/runner.py fsm_coverage --adapter dialog
+```
+
+## Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | All tests passed |
+| `1` | Some failures, pass_rate ≥ 0.5 |
+| `2` | Heavy failures, pass_rate < 0.5 |
+| `3` | Runtime error (import failure, etc.) |
 
 ## Research Mode
 

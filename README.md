@@ -37,42 +37,44 @@
 
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI 已安装
 - Python 3.8+
-- 你的项目中有一个意图识别模块（任何架构均可）
+- Pydantic 2.0+（`pip install pydantic>=2.0`）
 
-### 步骤 1：克隆本仓库
+### 一键安装
 
 ```bash
+# 1. 克隆本仓库
 git clone https://github.com/jiaxuan-yue/intent-test.git
-```
 
-### 步骤 2：安装 Skill 到你的项目
-
-将 `.claude/` 目录复制到你项目的根目录：
-
-```bash
-# 进入你的项目
+# 2. 进入你的项目目录
 cd your-project/
 
-# 复制 skill 文件
-cp -r /path/to/intent-test/.claude ./
-
-# 最终结构：
-# your-project/
-# └── .claude/
-#     ├── CLAUDE.md              # 项目上下文
-#     └── skills/
-#         ├── intent-test.md     # Skill 定义（核心）
-#         └── intent-test/
-#             └── runner.py      # 辅助执行脚本
+# 3. 运行安装脚本
+bash /path/to/intent-test/install.sh
 ```
 
-### 步骤 3：安装 Python 依赖
+安装脚本会自动将 skill 文件复制到 `.claude/skills/` 并检查依赖。
+
+### 其他安装方式
 
 ```bash
-pip install pydantic>=2.0
+# 安装到全局（所有项目可用）
+bash install.sh --global
+
+# 安装到指定目录
+bash install.sh --path /path/to/your/project
 ```
 
-### 步骤 4：验证安装
+### 手动安装
+
+如果不想用脚本，手动复制也可以：
+
+```bash
+mkdir -p .claude/skills/intent-test
+cp intent-test/.claude/skills/intent-test.md .claude/skills/
+cp intent-test/.claude/skills/intent-test/runner.py .claude/skills/intent-test/
+```
+
+### 验证安装
 
 启动 Claude Code，输入：
 
@@ -220,6 +222,7 @@ intent-test/
 │       ├── intent-test.md           # Skill 定义（Claude 指令）
 │       └── intent-test/
 │           └── runner.py            # 辅助执行脚本
+├── install.sh                       # 一键安装脚本
 ├── README.md                        # 本文件
 └── .gitignore
 ```

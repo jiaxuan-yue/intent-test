@@ -191,22 +191,80 @@ runner.py capabilities:
 
 ## Phase 4: Analyze Results (Claude's job)
 
-Read the reports runner.py produced. Analyze:
+Read the reports runner.py produced. Classify every failure by **root cause pattern** — these patterns are universal across all architectures:
 
-1. **Layer-specific pass rates** — which layer has the most failures?
-2. **Failure root causes** — keyword conflict? LLM routing error? FSM logic bug?
-3. **State transition coverage** — which paths are uncovered?
-4. **Architecture-aware suggestions** — fix keywords vs fix prompts vs fix FSM logic
+| Pattern | Symptom | Where to look |
+|---------|---------|---------------|
+| `wrong_match` | Input matched intent A, expected B | Keyword/pattern overlap between A and B |
+| `no_match` | Input matched nothing, expected X | Missing keyword, or input too far from all patterns |
+| `false_positive` | Input matched X, expected nothing | Keyword too broad, or missing guard condition |
+| `negation_miss` | `"不想X"` triggered X | Negation check missing before keyword match |
+| `confidence_wrong` | High confidence but wrong, or low but correct | Scoring function needs recalibration |
+| `state_stuck` | FSM didn't transition when it should | Transition condition too strict or missing |
+| `state_leak` | FSM transitioned when it shouldn't | Guard condition missing or too loose |
+| `routing_disagree` | L1 routing and L3 keyword gave different answers | Routing prompt misaligned with keyword definitions |
+| `timeout` | Response exceeded threshold | Regex too complex, or unnecessary computation |
+
+**For each failure, trace to code:**
+
+```
+Failure: wrong_match
+  Input: "今天天气不错"
+  Expected: no_match
+  Actual: time_intent (because "天" is in TIME_KEYWORDS)
+  Root cause: TIME_KEYWORDS contains single-char "天" — too broad
+  Code: prompts.py line 42, TIME_KEYWORDS = ["天", "周", "月", ...]
+  Fix pattern: narrow_keyword
+```
 
 ## Phase 5: Suggest & Apply Fixes (Claude's job)
 
-Generate fixes targeted at the correct layer:
+Generate fixes using **universal fix patterns** — these work regardless of architecture:
 
-| Layer | Fix types |
-|-------|-----------|
-| L1 Routing | Adjust LLM prompts, refine output parsing, add keyword guardrails |
-| L2 FSM | Fix state transition logic, add missing transitions, handle edge states |
-| L3 Keywords | Add/remove keywords, fix negation handling, resolve conflicts |
+| Fix pattern | When to apply | How |
+|-------------|--------------|-----|
+| `narrow_keyword` | `false_positive` — keyword too broad | Remove single-char keywords, add context requirement, or require word boundary |
+| `add_negation_guard` | `negation_miss` — negation not handled | Add `if is_no(input): return False` check BEFORE keyword match |
+| `disambiguate_keywords` | `wrong_match` — two intents share keywords | Add distinguishing keywords unique to each intent, remove shared ones |
+| `add_guard_condition` | `state_leak` — wrong transition triggered | Add pre-condition check (e.g., only transition if `turns > 0`) |
+| `relax_condition` | `state_stuck` — transition not triggering | Loosen the condition or add alternative trigger keywords |
+| `calibrate_threshold` | `confidence_wrong` — scoring misaligned | Adjust confidence threshold up/down, or change scoring weights |
+| `align_prompt` | `routing_disagree` — LLM and keywords disagree | Update LLM prompt to include keyword definitions, or add guardrail |
+| `add_fallback` | `no_match` on valid inputs | Add catch-all pattern or LLM fallback for unrecognized inputs |
+| `add_regression` | Any fix applied | Add the failing input as a regression test case |
+
+**Fix workflow:**
+
+```
+1. Sort failures by frequency (most common pattern first)
+2. For each pattern:
+   a. Show the failing inputs grouped by root cause
+   b. Show the specific code location
+   c. Propose the fix with a diff preview
+   d. If user approves: apply fix via Edit tool
+   e. Add failing inputs to regression test suite
+3. Re-run affected tests to verify fix
+4. Repeat until pass_rate improves or all fixable issues resolved
+```
+
+**Example output:**
+
+```
+🔴 Top issue: negation_miss (23 failures, 34% of all failures)
+
+  Affected functions: _is_learn_intent, _is_update_intent, _is_exit_intent
+  
+  Fix: Add negation guard to each function
+  ─── a/dialog.py ───
+  +++ b/dialog.py ───
+  @@ -42,6 +42,8 @@
+   def _is_learn_intent(text: str) -> bool:
+  +    if _is_no(text):
+  +        return False
+       return any(kw in text for kw in LEARN_KEYWORDS)
+
+  Apply? [y/N]
+```
 
 ## Output Files
 
@@ -218,6 +276,7 @@ Generate fixes targeted at the correct layer:
 | `{name}_layer1.json` | Claude | Routing test suite |
 | `layer{1,2,3}_report.json` | runner.py | Per-layer test results |
 | `unified_report.json` | runner.py | Combined layered report |
+| `regression.json` | Claude | Accumulated failing inputs (grows with each fix cycle) |
 
 ## Parameters
 
